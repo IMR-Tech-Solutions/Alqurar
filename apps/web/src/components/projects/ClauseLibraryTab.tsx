@@ -11,6 +11,7 @@ import {
   Search,
   Sparkles,
   Trash2,
+  X,
 } from "lucide-react";
 import { Card } from "@/components/ui/Card";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
@@ -19,6 +20,7 @@ import { apiErrorMessage } from "@/api/client";
 import {
   useClauseBookQuery,
   useClauseExtractStatus,
+  useClearClauseBook,
   useDeleteProjectClause,
   useExtractProjectClauses,
   usePccStatus,
@@ -54,6 +56,7 @@ export function ClauseLibraryTab({
   const { data: books = [] } = useBooksQuery();
   const { data: selectedBookId } = useClauseBookQuery(projectId);
   const selectBook = useSelectClauseBook(projectId);
+  const clearBook = useClearClauseBook(projectId);
 
   const uploadPcc = useUploadPcc(projectId);
   const pccStatus = usePccStatus(projectId);
@@ -68,6 +71,7 @@ export function ClauseLibraryTab({
   const [showAdd, setShowAdd] = useState(false);
   const [editClause, setEditClause] = useState<ClauseRef | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ClauseRef | null>(null);
+  const [confirmClearBook, setConfirmClearBook] = useState(false);
   const [pccErr, setPccErr] = useState("");
   const [bookErr, setBookErr] = useState("");
   const [contractErr, setContractErr] = useState("");
@@ -75,6 +79,7 @@ export function ClauseLibraryTab({
   // Only books whose clauses finished extracting can be used as a base.
   const readyBooks = useMemo(() => books.filter((b) => b.status === "done"), [books]);
   const hasBook = !!selectedBookId;
+  const bookBusy = selectBook.isPending || clearBook.isPending;
 
   // PCC comparison lifecycle.
   const pStatus = pccStatus.data?.status;
@@ -104,6 +109,13 @@ export function ClauseLibraryTab({
     [library],
   );
 
+  // Unselecting the book drops its copied clauses and anything the PCC added or
+  // amended on top of them — manual and AI-extracted clauses stay.
+  const bookSourcedTotal = useMemo(
+    () => library.filter((c) => c.source === "book" || c.source === "pcc").length,
+    [library],
+  );
+
   const filtered = useMemo(() => {
     let list = library;
     if (filter === "new") list = list.filter((c) => c.source === "pcc");
@@ -128,11 +140,26 @@ export function ClauseLibraryTab({
 
   async function onSelectBook(bookId: string) {
     setBookErr("");
-    if (!bookId) return;
+    // The blank option unselects the current book; confirm first, since it
+    // removes the clauses copied from it.
+    if (!bookId) {
+      if (hasBook) setConfirmClearBook(true);
+      return;
+    }
     try {
       await selectBook.mutateAsync(bookId);
     } catch (err) {
       setBookErr(apiErrorMessage(err, "Could not load the selected book's clauses."));
+    }
+  }
+
+  async function onClearBook() {
+    setConfirmClearBook(false);
+    setBookErr("");
+    try {
+      await clearBook.mutateAsync();
+    } catch (err) {
+      setBookErr(apiErrorMessage(err, "Could not remove the base contract book."));
     }
   }
 
@@ -185,11 +212,15 @@ export function ClauseLibraryTab({
               id="base-book"
               className="input"
               value={selectedBookId ?? ""}
-              disabled={!canManage || selectBook.isPending}
+              disabled={!canManage || bookBusy}
               onChange={(e) => onSelectBook(e.target.value)}
             >
               <option value="">
-                {readyBooks.length ? "Select a contract book…" : "No books ready in the Knowledge Center"}
+                {hasBook
+                  ? "None — remove the base book's clauses"
+                  : readyBooks.length
+                    ? "Select a contract book…"
+                    : "No books ready in the Knowledge Center"}
               </option>
               {readyBooks.map((b) => (
                 <option key={b.id} value={b.id}>
@@ -215,6 +246,21 @@ export function ClauseLibraryTab({
                 <span className="text-sm text-navy-700 inline-flex items-center gap-1.5">
                   <Loader2 className="size-4 animate-spin" /> Copying clauses…
                 </span>
+              )}
+              {clearBook.isPending && (
+                <span className="text-sm text-navy-700 inline-flex items-center gap-1.5">
+                  <Loader2 className="size-4 animate-spin" /> Removing clauses…
+                </span>
+              )}
+              {hasBook && (
+                <button
+                  className="btn btn-outline"
+                  onClick={() => setConfirmClearBook(true)}
+                  disabled={bookBusy}
+                  title="Unselect the base contract book"
+                >
+                  <X className="size-4" /> Remove book
+                </button>
               )}
               <button className="btn btn-primary" onClick={() => setShowAdd(true)}>
                 <Plus className="size-4" /> Add clause
@@ -571,6 +617,17 @@ export function ClauseLibraryTab({
           onClose={() => setEditClause(null)}
         />
       )}
+
+      <ConfirmDialog
+        open={confirmClearBook}
+        title="Remove base contract book"
+        message={`Unselect the base contract book? This removes the ${bookSourcedTotal} clause${
+          bookSourcedTotal === 1 ? "" : "s"
+        } copied from it, along with any Particular Conditions changes on top of them. Clauses you added by hand or extracted from an uploaded contract are kept.`}
+        confirmLabel="Remove book"
+        onConfirm={onClearBook}
+        onCancel={() => setConfirmClearBook(false)}
+      />
 
       <ConfirmDialog
         open={!!deleteTarget}

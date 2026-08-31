@@ -201,6 +201,48 @@ export function buildGanttModel(event: ProjectDelayEvent): GanttModel | null {
   };
 }
 
+/** Where a bar's date caption sits relative to the bar. */
+export type CaptionSide = "before" | "after" | "inside" | "hidden";
+
+/**
+ * Decide where a row's start and end date captions go.
+ *
+ * Captions are drawn in the bar's own colour, so one placed over its bar is
+ * invisible, and two placed on the same side land on top of each other. Both
+ * happen on bars that touch an edge of the axis, where there is no room outside
+ * — the first and last steps of a chronology always do. Preference is
+ * start-before / end-after, falling back to inside the bar (drawn in white, so
+ * it reads against the fill) where the bar is wide enough, and hidden where it
+ * is not.
+ *
+ * `capW` is the rendered width of a caption, in the same units as `timelineW`.
+ */
+export function captionPlacement(
+  row: Pick<GanttRow, "offset" | "width" | "milestone">,
+  timelineW: number,
+  capW: number,
+  gap = 4,
+): { start: CaptionSide; end: CaptionSide } {
+  const barLeft = row.offset * timelineW;
+  const barRight = (row.offset + row.width) * timelineW;
+  const roomBefore = barLeft >= capW + gap;
+  const roomAfter = timelineW - barRight >= capW + gap;
+
+  // A milestone is a diamond carrying one caption, so it may use either side.
+  if (row.milestone) {
+    return { start: roomBefore ? "before" : roomAfter ? "after" : "hidden", end: "hidden" };
+  }
+
+  // Only the captions with no room outside go inside, so a bar needs to hold
+  // both only when it is boxed in at both ends.
+  const needBoth = !roomBefore && !roomAfter;
+  const fitsInside = barRight - barLeft >= (needBoth ? 2 * capW + 3 * gap : capW + 2 * gap);
+  return {
+    start: roomBefore ? "before" : fitsInside ? "inside" : "hidden",
+    end: roomAfter ? "after" : fitsInside ? "inside" : "hidden",
+  };
+}
+
 /** Bar colour per party, as hex (screen) and RGB (PDF). */
 export const ACTOR_COLORS: Record<GanttActor, { hex: string; rgb: [number, number, number]; label: string }> = {
   Engineer: { hex: "#1f4a7d", rgb: [31, 74, 125], label: "Engineer activities" },

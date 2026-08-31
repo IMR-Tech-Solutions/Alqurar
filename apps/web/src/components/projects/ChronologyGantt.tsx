@@ -5,11 +5,20 @@
 // renders the identical chart.
 import { AlertTriangle, Info } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { ACTOR_COLORS, dayLabel, type GanttModel, type GanttRow } from "@/lib/chronologyGantt";
+import {
+  ACTOR_COLORS,
+  captionPlacement,
+  dayLabel,
+  type GanttModel,
+  type GanttRow,
+} from "@/lib/chronologyGantt";
 
 const MONTH_W = 54; // px per month column — the chart scrolls when it overflows
 const ROW_H = 26;
 const LABEL_W = 300;
+// Rendered width of a date caption ("15-Aug-24" at 8px tabular-nums), used to
+// work out which side of a bar it fits on.
+const CAPTION_W = 44;
 
 export function ChronologyGantt({
   model,
@@ -173,9 +182,10 @@ function GanttBarRow({
   const color = ACTOR_COLORS[row.actor].hex;
   const leftPct = row.offset * 100;
   const widthPct = row.width * 100;
-  // Date captions sit outside the bar when there's room on that side, so short
-  // bars stay readable.
-  const labelOutsideLeft = row.offset > 0.12;
+  // Date captions sit outside the bar where there's room on that side, and
+  // inside it (in white) where there isn't, so they never land on the bar in its
+  // own colour or on top of each other.
+  const caps = captionPlacement(row, timelineW, CAPTION_W);
 
   return (
     <div className={cn("flex border-b border-border/60 last:border-b-0", zebra && "bg-navy-50/30")}>
@@ -213,19 +223,30 @@ function GanttBarRow({
         )}
 
         {/* Start / end captions */}
-        <span
-          className={cn(
-            "absolute top-1/2 -translate-y-1/2 text-[8px] tabular-nums whitespace-nowrap",
-            labelOutsideLeft ? "-translate-x-full pr-1" : "pl-1",
-          )}
-          style={{ left: `${leftPct}%`, color }}
-        >
-          {row.startLabel}
-        </span>
-        {!row.milestone && (
+        {caps.start !== "hidden" && (
           <span
-            className="absolute top-1/2 -translate-y-1/2 text-[8px] tabular-nums whitespace-nowrap pl-1"
-            style={{ left: `${leftPct + widthPct}%`, color }}
+            className={cn(
+              "absolute top-1/2 -translate-y-1/2 text-[8px] tabular-nums whitespace-nowrap",
+              caps.start === "before" ? "-translate-x-full pr-1" : "pl-1",
+            )}
+            style={{
+              left: `${caps.start === "after" ? leftPct + widthPct : leftPct}%`,
+              color: caps.start === "inside" ? "#fff" : color,
+            }}
+          >
+            {row.startLabel}
+          </span>
+        )}
+        {caps.end !== "hidden" && (
+          <span
+            className={cn(
+              "absolute top-1/2 -translate-y-1/2 text-[8px] tabular-nums whitespace-nowrap",
+              caps.end === "after" ? "pl-1" : "-translate-x-full pr-1",
+            )}
+            style={{
+              left: `${leftPct + widthPct}%`,
+              color: caps.end === "inside" ? "#fff" : color,
+            }}
           >
             {row.endLabel}
           </span>

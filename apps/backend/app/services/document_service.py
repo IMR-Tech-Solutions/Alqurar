@@ -136,6 +136,28 @@ def list_text_sources(project_id: str) -> List[Tuple[str, str, str, Optional[str
         return [(d.id, d.name or "file", d.type or "Other", d.extractedText) for d in rows]
 
 
+def list_analyses(project_id: str) -> List[Dict]:
+    """Return {name, type, analysis} for each document — the data-room register.
+
+    Contractor-admissibility scoring reads this rather than `list_text_sources`:
+    the stored analysis is an order of magnitude smaller than the extracted text,
+    so the whole room fits in one cached request instead of being split into parts
+    that each have to be re-read for every batch of events. `analysis` is {} for a
+    document that hasn't been analysed yet.
+    """
+    with SessionLocal() as db:
+        rows = (
+            db.query(Document.name, Document.type, Document.analysis)
+            .filter(Document.projectId == project_id)
+            .order_by(Document.uploadedAt)
+            .all()
+        )
+    return [
+        {"name": name or "file", "type": doc_type or "Other", "analysis": analysis or {}}
+        for name, doc_type, analysis in rows
+    ]
+
+
 def get_document_file(document_id: str) -> Optional[Tuple[bytes, str, str]]:
     """Return (bytes, filename, mime) for a stored document, or None."""
     with SessionLocal() as db:

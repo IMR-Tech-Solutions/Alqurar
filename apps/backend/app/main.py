@@ -13,6 +13,9 @@ from app.services.client_profile_service import ensure_tokens
 from app.services.document_service import list_unfinished_analysis_ids
 from app.services.document_analysis import run_many
 from app.services.contract_book_service import list_unfinished_book_ids
+from app.services.contractor_admissibility_service import (
+    fail_interrupted as fail_interrupted_scorings,
+)
 from app.services.book_clause_extraction import run_many as run_many_books
 from app.services.archive_extract import unpack_status
 
@@ -34,6 +37,14 @@ async def lifespan(_app: FastAPI):
         "Archive unpackers available: %s (ZIP and TAR are always supported)",
         ", ".join(found) if found else "none — RAR/7z bundles cannot be unpacked",
     )
+
+    # A contractor scoring keeps its progress in memory, so one interrupted by a
+    # restart would leave the tab polling a job that no longer exists. These can't
+    # be resumed and re-running them costs real money, so fail them and let the
+    # analyst retry.
+    interrupted = fail_interrupted_scorings()
+    if interrupted:
+        log.info("Marked %d interrupted contractor scoring(s) as failed", interrupted)
 
     # Resume any document analyses that a previous run left unfinished, so they
     # don't sit "pending" forever. Runs in the background (semaphore-bounded).

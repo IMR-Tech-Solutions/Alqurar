@@ -40,6 +40,23 @@ ANALYSIS_MODEL = os.getenv("ANTHROPIC_ANALYSIS_MODEL", "claude-haiku-4-5")
 # "claude-opus-4-8" for maximum depth, "claude-haiku-4-5" for maximum speed).
 EXTRACTION_MODEL = os.getenv("ANTHROPIC_EXTRACTION_MODEL", "claude-sonnet-4-6")
 
+# The whole data room goes into the delay-event and contractor-admissibility
+# prompts, and on a large project that overran the model's context window (1.27M
+# tokens against Sonnet 4.6's 1M), failing the run with a 400 "prompt is too
+# long". Documents are packed into batches under this budget instead — no
+# document is ever truncated, and the per-batch results are consolidated
+# afterwards. The budget sits well under the window because dense OCR/table text
+# tokenizes worse than prose.
+EXTRACTION_BATCH_TOKENS = int(os.getenv("EXTRACTION_BATCH_TOKENS", "250000"))
+EXTRACTION_BATCH_CONCURRENCY = int(os.getenv("EXTRACTION_BATCH_CONCURRENCY", "3"))
+# Conservative chars-per-token for sizing batches: this data room measured ~2.7,
+# and under-estimating tokens is what causes the 400 we are avoiding.
+_CHARS_PER_TOKEN = 2.2
+# The contractor register is clean prose, not OCR: it measured 3.95 chars/token,
+# so it is sized with a ratio of its own — still conservative, but not so
+# conservative that a room which fits one request gets split anyway.
+_DIGEST_CHARS_PER_TOKEN = 3.5
+
 # Stable instructions — cached as a prompt prefix so repeated calls are cheaper.
 SYSTEM_PROMPT = (
     "You are a construction claims analyst supporting Extension of Time (EOT) and "
@@ -59,7 +76,11 @@ SYSTEM_PROMPT = (
     "- 'relevance_to_claim' should state, in one or two sentences, how this document "
     "supports or undermines an EOT/delay claim (e.g. evidences an employer-caused "
     "delay, establishes a contractual notice, records a critical-path activity).\n"
-    "- 'confidence' is an integer 0-100 reflecting how confident you are overall."
+    "- 'confidence' is an integer 0-100 reflecting how confident you are overall.\n"
+    "- This is a summary, not a transcription. Keep 'summary' to at most six "
+    "sentences, and cap 'key_points' at 8 entries, 'parties' at 10 and 'key_dates' "
+    "at 12 — select the most claim-relevant ones. Registers, chronologies and site "
+    "diaries can list hundreds of entries; never enumerate them all."
 )
 
 # JSON schema mirroring app.schemas.document.DocumentAnalysis (structured outputs).
@@ -90,13 +111,43 @@ _OUTPUT_SCHEMA = {
     "additionalProperties": False,
 }
 
+# Output budget for one document classification. The schema can't bound list
+# lengths (structured outputs reject maxItems), so the prompt asks for brevity and
+# this leaves headroom for a document that ignores it.
+_ANALYSIS_MAX_TOKENS = 8000
+
+# Fallbacks for fields missing from a truncated response, so a partial
+# classification still validates against DocumentAnalysis.
+_ANALYSIS_DEFAULTS = {
+    "document_type": "Other",
+    "title": "",
+    "summary": "",
+    "relevance_to_claim": "",
+    "supports_eot": False,
+    "key_points": [],
+    "parties": [],
+    "key_dates": [],
+    "confidence": 0,
+}
+
 
 @lru_cache(maxsize=1)
 def _client() -> anthropic.AsyncAnthropic:
     # Resolves ANTHROPIC_API_KEY from the environment. A generous per-request
     # timeout (and a few built-in retries) so a long streamed extraction — e.g. a
     # whole contract book — is never cut short by the SDK's default time limit.
-    return anthropic.AsyncAnthropic(timeout=900.0, max_retries=4)
+    #
+    # An identity-linked API key isn't bound to a single workspace, so every
+    # request has to name the workspace it acts in or the API rejects it with a
+    # 400. A plain workspace-scoped key carries that itself and needs no header,
+    # so this is sent only when the variable is set.
+    headers = {}
+    workspace = (os.getenv("ANTHROPIC_WORKSPACE_ID") or "").strip()
+    if workspace:
+        headers["anthropic-workspace-id"] = workspace
+    return anthropic.AsyncAnthropic(
+        timeout=900.0, max_retries=4, default_headers=headers or None
+    )
 
 
 # ── OCR (for scanned PDFs / images) ─────────────────────────────────────────
@@ -284,6 +335,56 @@ async def ocr_pdf_pages(
     return "", last_err or "vision OCR produced no text"
 
 
+def _salvage_truncated_object(payload: str) -> dict | None:
+    """Recover the complete members of a JSON object that was cut off mid-write.
+
+    A response that stops at max_tokens ends with a half-written key or value, so
+    `json.loads` rejects the whole payload and a document the model had otherwise
+    classified fine is recorded as a failure. Replaying the payload and remembering
+    the last position where a top-level member ended keeps the fields it finished.
+    Returns None if not even one member completed.
+    """
+    start = payload.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+    last_member_end = -1  # index of the comma closing the last complete member
+
+    for i in range(start, len(payload)):
+        ch = payload[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+            if depth == 0:  # the object did close — it wasn't truncated after all
+                try:
+                    return json.loads(payload[start : i + 1])
+                except json.JSONDecodeError:
+                    return None
+        elif ch == "," and depth == 1:
+            last_member_end = i
+
+    if last_member_end == -1:
+        return None
+    try:
+        return json.loads(payload[start:last_member_end] + "}")
+    except json.JSONDecodeError:
+        return None
+
+
 def _build_user_content(text: str, filename: str, truncated: bool, claim_context: str) -> str:
     parts = [f"Filename: {filename}"]
     if claim_context:
@@ -323,9 +424,14 @@ async def analyze_document(
     # Classification is simple — run it on the fast model with no extended thinking
     # and no effort knob (Haiku doesn't take `effort`). Structured output guarantees
     # the JSON shape. This keeps per-document latency and cost low at scale.
+    #
+    # max_tokens is generous relative to the summary we ask for: structured output
+    # guarantees the shape but not that it fits, and a document with hundreds of
+    # dated entries (a chronology, a site-diary register) will happily run past a
+    # tight ceiling and leave the JSON cut off mid-string.
     response = await _client().messages.create(
         model=ANALYSIS_MODEL,
-        max_tokens=2048,
+        max_tokens=_ANALYSIS_MAX_TOKENS,
         system=[
             {
                 "type": "text",
@@ -341,7 +447,24 @@ async def analyze_document(
 
     # With output_config.format, the JSON is guaranteed in the text block.
     payload = next((b.text for b in response.content if b.type == "text"), "")
-    return DocumentAnalysis(**json.loads(payload))
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        # Truncated at max_tokens. Keep whatever the model completed rather than
+        # failing the document outright — the leading fields (type, title, summary)
+        # are the ones the data room actually shows.
+        data = _salvage_truncated_object(payload)
+        if data is None:
+            raise ValueError(
+                "The AI response was cut short before any field completed "
+                f"(stop_reason={response.stop_reason}). Try analysing again."
+            ) from None
+        logger.warning(
+            "analyze_document: truncated response for %s (stop_reason=%s); "
+            "salvaged %d of %d fields",
+            filename, response.stop_reason, len(data), len(_ANALYSIS_DEFAULTS),
+        )
+    return DocumentAnalysis(**{**_ANALYSIS_DEFAULTS, "title": filename, **data})
 
 
 # ── Delay-event extraction ──────────────────────────────────────────────────
@@ -513,6 +636,40 @@ def _salvage_array_items(payload: str, key: str) -> list[dict]:
     return items
 
 
+def _batch_by_token_budget(
+    documents: list[dict],
+    budget_tokens: int,
+    chars_per_token: float = _CHARS_PER_TOKEN,
+) -> list[list[dict]]:
+    """Pack documents into batches that each fit inside a single request.
+
+    Greedy and order-preserving, so documents uploaded together stay together and
+    one event's evidence usually lands in a single batch. A document larger than
+    the budget gets a batch of its own rather than being cut short: batching
+    exists precisely so that no document has to be truncated.
+
+    `chars_per_token` defaults to the ratio for raw extracted text. Pass a higher
+    one for prose — the register in `_contractor_digest` measures 3.95, so sizing
+    it at 2.2 would split a room that comfortably fits one request, and a needless
+    split doubles the cost of every batch of events that reads it.
+    """
+    budget_chars = max(1, int(budget_tokens * chars_per_token))
+    batches: list[list[dict]] = []
+    current: list[dict] = []
+    used = 0
+    for d in documents:
+        # +200 covers the "===== Document: name [type] =====" header and newlines.
+        size = len(d.get("text") or "") + len(d.get("name") or "") + 200
+        if current and used + size > budget_chars:
+            batches.append(current)
+            current, used = [], 0
+        current.append(d)
+        used += size
+    if current:
+        batches.append(current)
+    return batches or [[]]
+
+
 async def extract_delay_events(
     *,
     documents: list[dict],
@@ -528,6 +685,12 @@ async def extract_delay_events(
     so the Delay Events tab links straight back to the library. Returns a list of
     plain dicts (one per event) with the AI's structured fields plus the raw
     `sourceDocuments` filenames — the caller maps those to source records.
+
+    A data room that doesn't fit the model's context window is split into batches
+    that are extracted in parallel and then consolidated. Batching never drops or
+    truncates a document — every page still reaches the model — so the only cost
+    is that one event can be drafted twice from evidence that landed in different
+    batches, which the consolidation pass folds back into a single event.
     """
     ctx_bits = []
     if project_name:
@@ -536,7 +699,48 @@ async def extract_delay_events(
         ctx_bits.append(f"Contract standard: {standard}")
     header = " | ".join(ctx_bits)
 
+    batches = _batch_by_token_budget(documents, EXTRACTION_BATCH_TOKENS)
+    if len(batches) == 1:
+        return await _extract_events_batch(batches[0], header, clauses)
+
+    logger.info(
+        "Data room exceeds one request — extracting delay events from %d documents "
+        "in %d batches",
+        len(documents),
+        len(batches),
+    )
+    sem = asyncio.Semaphore(max(1, EXTRACTION_BATCH_CONCURRENCY))
+
+    async def _run(index: int, batch: list[dict]) -> list[dict]:
+        async with sem:
+            return await _extract_events_batch(
+                batch, header, clauses, part=(index + 1, len(batches))
+            )
+
+    drafted = await asyncio.gather(*(_run(i, b) for i, b in enumerate(batches)))
+    return await _consolidate_delay_events([ev for batch in drafted for ev in batch])
+
+
+async def _extract_events_batch(
+    documents: list[dict],
+    header: str,
+    clauses: list[dict] | None,
+    part: tuple[int, int] | None = None,
+) -> list[dict]:
+    """Run one delay-event extraction request over `documents`.
+
+    `part` is (n, total) when the data room was split; it tells the model it is
+    seeing one slice, so it doesn't reason about what the project as a whole is
+    missing.
+    """
     blocks = [header] if header else []
+    if part:
+        blocks.append(
+            f"\nNOTE: these are part {part[0]} of {part[1]} of this project's data "
+            "room. Identify the events evidenced by the documents below. The other "
+            "parts are analysed separately, so do not conclude that a document or a "
+            "piece of evidence is absent from the project as a whole."
+        )
     for d in documents:
         name = d.get("name", "document")
         note = " (truncated)" if d.get("truncated") else ""
@@ -601,6 +805,195 @@ async def extract_delay_events(
             "The AI returned a malformed delay-event register. Please try again."
         ) from None
 
+
+# ── Consolidating a batched register ────────────────────────────────────────
+# Batches see different slices of the data room, so one delay can be drafted more
+# than once — e.g. from the notice in one batch and the site records in another.
+# The model only identifies which drafts describe the same event; the merge below
+# is done in code, so consolidation can never lose an event or rewrite its text.
+
+_EVENT_MERGE_SYSTEM_PROMPT = (
+    "You are a forensic delay analyst consolidating a draft Extension of Time "
+    "register. It was drafted in several passes over different parts of one "
+    "project's data room, so the same underlying delay can appear more than once, "
+    "worded differently and supported by different documents.\n\n"
+    "You are given a numbered list of draft events. Return groups of index numbers "
+    "that describe the SAME underlying delay event.\n\n"
+    "Rules:\n"
+    "- Group only genuine duplicates: the same disruption to the same part of the "
+    "works over the same period, however differently the two drafts word it.\n"
+    "- Events sharing a cause but affecting different work fronts, locations, "
+    "trades or periods are DIFFERENT events — do not group them. Overlapping dates "
+    "alone are not evidence of a duplicate.\n"
+    "- Merging two distinct events is far more damaging than leaving a duplicate, "
+    "so group only where you are confident.\n"
+    "- Each index may appear in at most one group. Leave out events with no "
+    "duplicate; return an empty list if nothing duplicates."
+)
+
+_EVENT_MERGE_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "duplicates": {
+            "type": "array",
+            "items": {"type": "array", "items": {"type": "integer"}},
+        }
+    },
+    "required": ["duplicates"],
+    "additionalProperties": False,
+}
+
+
+def _as_int(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _events_for_merge(events: list[dict]) -> str:
+    """Render the drafted register as a compact numbered list for the merge pass."""
+    lines = []
+    for i, e in enumerate(events):
+        narrative = " ".join((e.get("narrative") or "").split())[:300]
+        sources = ", ".join((e.get("sourceDocuments") or [])[:6])
+        lines.append(
+            f"[{i}] {e.get('title', '')} | {e.get('category', '')} "
+            f"| cause={e.get('cause', '')} "
+            f"| {e.get('startDate') or 'unknown'} to {e.get('endDate') or 'unknown'} "
+            f"| clause={e.get('clause', '')}\n"
+            f"    {narrative}\n"
+            f"    sources: {sources}"
+        )
+    return "\n".join(lines)
+
+
+def _combine_events(group: list[dict], primary: dict) -> dict:
+    """Merge duplicate drafts into one event, keeping the union of their evidence."""
+    merged = dict(primary)
+    # Lead with the primary draft's evidence, so the source list reads in the
+    # same order as the narrative that was kept.
+    ordered = [primary] + [e for e in group if e is not primary]
+
+    names: list[str] = []
+    for e in ordered:
+        for n in e.get("sourceDocuments") or []:
+            if n not in names:
+                names.append(n)
+    merged["sourceDocuments"] = names
+
+    rows: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for e in ordered:
+        for c in e.get("chronology") or []:
+            key = (
+                (c.get("date") or "").strip(),
+                " ".join((c.get("title") or "").split()).lower(),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(c)
+    # Undated rows sort last rather than jumping to the top of the chronology.
+    rows.sort(key=lambda c: (c.get("date") or "9999-12-31"))
+    merged["chronology"] = rows
+
+    starts = [s for s in ((e.get("startDate") or "").strip() for e in group) if s]
+    ends = [s for s in ((e.get("endDate") or "").strip() for e in group) if s]
+    if starts:
+        merged["startDate"] = min(starts)
+    if ends:
+        merged["endDate"] = max(ends)
+    merged["daysImpact"] = max(_as_int(e.get("daysImpact")) for e in group)
+    merged["aiConfidence"] = max(_as_int(e.get("aiConfidence")) for e in group)
+    merged["criticalPath"] = any(bool(e.get("criticalPath")) for e in group)
+    return merged
+
+
+def _fold_duplicate_events(events: list[dict], groups) -> list[dict]:
+    """Apply the merge pass's duplicate groups, preserving the drafted order.
+
+    Every index the model returns is validated against the register, so a
+    malformed or out-of-range group is ignored rather than corrupting the result.
+    """
+    claimed: set[int] = set()
+    folded: dict[int, dict] = {}
+    dropped: set[int] = set()
+    for group in groups or []:
+        if not isinstance(group, list):
+            continue
+        idxs = [
+            i
+            for i in dict.fromkeys(group)
+            if isinstance(i, int)
+            and not isinstance(i, bool)
+            and 0 <= i < len(events)
+            and i not in claimed
+        ]
+        if len(idxs) < 2:
+            continue
+        claimed.update(idxs)
+        # The best-supported draft leads; the others fold their evidence into it.
+        primary = max(
+            idxs,
+            key=lambda i: (
+                _as_int(events[i].get("aiConfidence")),
+                len(events[i].get("narrative") or ""),
+            ),
+        )
+        folded[primary] = _combine_events([events[i] for i in idxs], events[primary])
+        dropped.update(i for i in idxs if i != primary)
+    if not folded:
+        return events
+    return [folded.get(i, e) for i, e in enumerate(events) if i not in dropped]
+
+
+async def _consolidate_delay_events(events: list[dict]) -> list[dict]:
+    """Fold events that separate batches drafted from the same underlying delay.
+
+    Only ever merges: no event is dropped, and a merged event keeps the union of
+    both drafts' source documents and chronology. If the consolidation call fails
+    the register is returned exactly as drafted — a visible duplicate is a much
+    smaller problem than a lost event.
+    """
+    if len(events) < 2:
+        return events
+    try:
+        async with _client().messages.stream(
+            model=EXTRACTION_MODEL,
+            # The output is just index groups; the budget is for the reasoning.
+            max_tokens=16000,
+            thinking={"type": "adaptive"},
+            system=[
+                {
+                    "type": "text",
+                    "text": _EVENT_MERGE_SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            messages=[{"role": "user", "content": _events_for_merge(events)}],
+            output_config={
+                "effort": "medium",
+                "format": {"type": "json_schema", "schema": _EVENT_MERGE_OUTPUT_SCHEMA},
+            },
+        ) as stream:
+            response = await stream.get_final_message()
+        payload = "".join(b.text for b in response.content if b.type == "text").strip()
+        groups = json.loads(payload).get("duplicates", []) if payload else []
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Delay-event consolidation failed (%s) — keeping all %d drafted events",
+            exc,
+            len(events),
+        )
+        return events
+
+    merged = _fold_duplicate_events(events, groups)
+    if len(merged) != len(events):
+        logger.info(
+            "Consolidated %d drafted delay events into %d", len(events), len(merged)
+        )
+    return merged
 
 # ── Per-event chronology generation ─────────────────────────────────────────
 # Builds a detailed, dated chronology for EACH existing delay event, grounded in
@@ -1417,68 +1810,204 @@ async def interpret_modifications(
 # Assembles a full Extension of Time claim document from the project's delay
 # events and data-room documents, following the standard claim structure.
 
-_CLAIM_SYSTEM_PROMPT = (
+# The labels that keep documentary fact, each party's case, and the analyst's own
+# inference visibly apart — the distinction a claim stands or falls on. Shared
+# between the prompt and the output schema so the two can't drift.
+_STATEMENT_LABELS = [
+    "Fact",
+    "Contractor's position",
+    "Engineer / Employer's position",
+    "Analysis",
+    "Missing evidence",
+    "Assessment",
+]
+
+# Standing instructions, identical on every pass. Kept byte-stable and cached as a
+# prompt prefix: the per-pass task text rides in the user turn instead, so all the
+# calls that build one claim share a cache hit.
+_CLAIM_HOUSE_RULES = (
     "You are a senior forensic delay analyst at Al Qarar Management Solutions "
     "(AQMS) drafting a formal, submission-ready Extension of Time (EOT) claim for a "
-    "construction project under a standard form such as FIDIC, NEC4 or CPWD.\n\n"
-    "You are given the project and contract particulars, the delay-events register "
-    "(causes, dates, day impacts, narratives, per-event chronologies and sources), "
-    "the project's Clause Library, the admissibility assessment, the selected delay "
-    "analysis methodology, the queries/RFI register, and the data-room document "
-    "schedule. Use ALL of it — every section below must be grounded in that data.\n\n"
-    "ABSOLUTE RULE — never invent. Do not fabricate clause numbers, dates, parties, "
-    "programme dates, quantities or figures. Every clause citation must come from the "
-    "Clause Library or a delay event's `clause`. Every date must come from the data. "
-    "Where the data does not support a section, say so plainly in that section "
-    "(e.g. 'The Contractor's records supplied to date do not evidence X') rather than "
-    "filling the gap. A thin register produces a short claim, not an embellished one.\n\n"
-    "STRUCTURE — produce these numbered top-level sections, in this order, each with "
-    "the listed subsections. Omit a subsection only when it has no data at all.\n"
-    "1. ABBREVIATIONS — a table of the abbreviations actually used in this document.\n"
-    "2. DEFINITIONS — a table defining the contractual terms actually used.\n"
-    "3. INTRODUCTION — subsections: Summary of Delay Events (table: Ref, Event, "
-    "Cause/Party, Period, Days Impact, Critical); Summary of Relief Sought; Framework "
-    "of the Submission; Purpose of the Submission; Reservation of Rights.\n"
-    "4. THE PROJECT AND THE CONTRACT — subsections: Parties to the Contract; The "
-    "Contract Agreement; Salient Features of the Contract (table of the contract "
-    "particulars supplied); Programme (baseline and any submissions evidenced).\n"
-    "5. DELAY AND DISRUPTION TO THE PROGRESS — the factual narrative of how the works "
-    "were delayed, built from the per-event chronologies in date order.\n"
-    "6. CONTRACTUAL ENTITLEMENT TO EXTENSION OF TIME — the entitlement argument built "
-    "on the Clause Library, including a Key Contractual Clauses table (Clause, Title, "
-    "Effect/Relevance). Where a clause is marked modified by a PCC amendment, address "
-    "the amended wording and its interpretation.\n"
-    "7. DELAY EVENTS — one subsection PER delay event, headed '<ref> — <title>', each "
-    "covering: the factual narrative; the chronology (as a table: Date, Actor, Event); "
-    "the contractual basis citing that event's clause; the supporting evidence naming "
-    "the source documents; and the assessed time impact with its admissibility.\n"
-    "8. DELAY ANALYSIS METHODOLOGY — the methodology selected for this project, why it "
-    "suits the available records, and how it is applied. Use the supplied methodology "
-    "assessment; do not assert a method the assessment does not support.\n"
-    "9. WINDOW PERIODS AND TIME IMPACT ANALYSIS — this project has no parsed baseline "
-    "or updated programme, so a windowed Time Impact Analysis CANNOT be performed. "
-    "Emit exactly one block of type 'note' stating that the windowed TIA, the "
-    "impacted-programme tables and the milestone completion dates require the baseline "
-    "and updated programmes (P6 XER / P6 XML / MS Project) to be loaded and analysed, "
-    "and that this section is to be completed once that analysis is available. Do NOT "
-    "estimate window impacts or completion dates.\n"
-    "10. QUERIES AND REQUESTS FOR INFORMATION — the RFI register as a table (Date, "
-    "Query, Response, Date of Response, Status), and what any open queries mean for "
-    "this submission.\n"
-    "11. SUMMARY AND RELIEF SOUGHT — the consolidated position: total days claimed, "
-    "the split between excusable and culpable delay as evidenced, and the relief "
-    "requested. State clearly that the total is the sum of the assessed event impacts "
-    "and is subject to the windowed TIA in section 9.\n"
-    "12. SCHEDULE OF ATTACHMENTS — a table of the supporting documents relied upon.\n\n"
-    "WRITING — formal, factual, third-person, in the register of a contractual "
-    "submission. Refer to 'the Contractor', 'the Employer', 'the Engineer'. Number "
-    "sections '1', '2' and subsections '1.1', '1.2'. Prefer a table wherever the "
-    "content is a register or a set of particulars; prose is for argument, not lists "
-    "of facts. Keep every table's `columns` and each row the same length."
+    "construction project under a standard form such as FIDIC, NEC4 or CPWD. You are "
+    "writing one part of that claim; the surrounding sections are drafted separately, "
+    "so produce only what the task asks for.\n\n"
+    "── NEVER INVENT ───────────────────────────────────────────────\n"
+    "This document may be relied on in a contractual submission or in dispute "
+    "proceedings. A fabricated date or clause is worse than a gap. Do NOT invent: "
+    "dates, contract values, programme revisions, completion dates, EOT days, delay "
+    "durations, clause numbers or amendments, notices, correspondence, evidence, "
+    "critical-path activities, programme results, delay-analysis results, or "
+    "attachments. Every clause you cite must appear in the supplied Clause Library or "
+    "on a delay event. Every date, party, figure and document name must come from the "
+    "supplied records.\n"
+    "Where the records do not support a statement, say so in the report using one of: "
+    "'Not available in the supplied records.' / 'To be confirmed.' / 'Evidence "
+    "required.' / 'Unable to establish from the supplied documents.' A thin evidence "
+    "set produces a short, heavily-qualified section — never an embellished one.\n\n"
+    "── SEPARATE FACT FROM ANALYSIS ────────────────────────────────\n"
+    "Use `statement` blocks, each carrying one of these labels, wherever the "
+    "distinction matters:\n"
+    "  Fact — what a supplied document records. Name the document.\n"
+    "  Contractor's position — what the Contractor asserts, per the correspondence.\n"
+    "  Engineer / Employer's position — what the Engineer or Employer asserts. Where "
+    "the parties disagree, present the two positions as SEPARATE statements. Never "
+    "merge them, and never let one side's assertion stand as fact.\n"
+    "  Analysis — your inference or opinion. Must be labelled as such, never written "
+    "as documentary fact.\n"
+    "  Missing evidence — what would be needed to close a gap.\n"
+    "  Assessment — a concluded position, with its reasoning.\n\n"
+    "── EVIDENCE TRACEABILITY ──────────────────────────────────────\n"
+    "Every material factual statement must be traceable to a source document. Name "
+    "the document inline (e.g. 'the Engineer's letter of 14 March 2025') and list the "
+    "documents relied on in an `evidence` block. Only ever name documents that appear "
+    "in the supplied data-room schedule — never a document you expect to exist.\n\n"
+    "── WRITING ────────────────────────────────────────────────────\n"
+    "Formal, factual, third person, in the register of a contractual submission — "
+    "'the Contractor', 'the Employer', 'the Engineer'. Prefer a table wherever the "
+    "content is a register or a set of particulars; prose is for argument, not for "
+    "lists of facts. Give every table a caption. Keep each table row exactly as long "
+    "as its `columns`, and put 'Not available in the supplied records.' in a cell "
+    "rather than leaving it blank or inventing a value. Let the volume of supplied "
+    "evidence set the length: cover every event and document the records support, and "
+    "do not pad where they are thin."
 )
 
-# Two levels of nesting only (section → subsection). Structured outputs reject
-# recursive schemas, so the depth is spelled out rather than self-referenced.
+# ── Per-pass task instructions (user turn) ──────────────────────────────────
+
+_CLAIM_TASK_FRONT = (
+    "TASK — draft the front matter and the contractual case: sections 1 to 5.\n\n"
+    "Return `title` (e.g. 'Extension of Time Claim'), `reference` (the project code "
+    "and contract reference as supplied), and these sections:\n\n"
+    "1. ABBREVIATIONS AND DEFINITIONS\n"
+    "   1.1 Abbreviations — table (Abbreviation, Meaning) of abbreviations this claim "
+    "actually uses.\n"
+    "   1.2 Definitions — table (Term, Definition) of contractual and project terms "
+    "drawn from the supplied contract and project records.\n\n"
+    "2. EXECUTIVE SUMMARY\n"
+    "   2.1 Introduction — the project, Contractor, Employer, Engineer, contract, the "
+    "purpose of this claim, the claim cut-off date, and the general basis of "
+    "entitlement.\n"
+    "   2.2 Summary of Delay Events — table (Delay Event, Description, Cause, "
+    "Responsible Party, Start Date, End Date, Claimed/Assessed Days, "
+    "Critical/Non-Critical, Contractual Basis), one row per supplied event.\n"
+    "   2.3 Summary of Relief Sought — EOT requested, delay period, original "
+    "completion date, revised completion date, any evidenced cost entitlement, other "
+    "contractual relief. Where entitlement cannot yet be established because programme "
+    "data is missing, say so explicitly here.\n"
+    "   2.4 Framework of the Submission — how this report is organised: Introduction, "
+    "Project Background, Basis of Claim, Delay Events, Delay Analysis Methodology, "
+    "Delay Analysis Results, Summary and Conclusion.\n"
+    "   2.5 Purpose of the Submission\n"
+    "   2.6 Reservation of Rights\n\n"
+    "3. PROJECT DETAILS\n"
+    "   3.1 Parties to the Contract\n"
+    "   3.2 Contract Agreement\n"
+    "   3.3 Salient Features of the Contract — table (Item, Particular) covering, only "
+    "where supplied: Project, Employer, Contractor, Engineer, Contract Type, Contract "
+    "Standard, Contract Value, Contract Date, Commencement Date, Time for Completion, "
+    "Original Completion Date, Accepted Contract Amount, Delay Damages, Governing Law, "
+    "Dispute Resolution, and any other important contractual provisions.\n"
+    "   3.4 Programme — the baseline programme, revisions, accepted/approved "
+    "programme, updates, as-built programme and data dates. Follow the PROGRAMME "
+    "RECORDS status given below exactly; do not describe a programme that has not been "
+    "supplied.\n\n"
+    "4. BASIS OF THE CLAIM\n"
+    "   4.1 Delay and Disruption to the Progress — the overall factual narrative: what "
+    "happened, why, who was responsible, how the Works and the planned sequence were "
+    "affected, how the critical path may have been affected, and what mitigation the "
+    "Contractor undertook. Build this from the per-event chronologies in date order.\n"
+    "   4.2 Contractual Entitlement to Extension of Time — for each applicable "
+    "provision in the Clause Library: the sub-clause, its title, the contractual "
+    "requirement, how the delay events satisfy it, the notice requirement, any "
+    "time-bar, the evidence of compliance, the potential weaknesses, and the missing "
+    "evidence. Include a table (Clause, Title, Requirement, Relevance, "
+    "Compliance/Risk). Where a clause is marked amended by the Particular Conditions, "
+    "address the amended wording and its interpretation. Do not present an uncertain "
+    "contractual conclusion as settled — label it Analysis or Assessment.\n\n"
+    "5. DELAY EVENTS — return this section with its 5.1 Introduction subsection ONLY: "
+    "explain how the events were identified from the records and how each is assessed. "
+    "The individual events are drafted separately, so leave the rest to us.\n"
+)
+
+_CLAIM_TASK_EVENT = (
+    "TASK — draft ONE delay event subsection for section 5 of the claim.\n\n"
+    "Return `heading` as '<ref> — <title>' for the event given below, and `parts` "
+    "using exactly this template. Use every part; where the records do not support "
+    "one, keep the part and say so in it.\n\n"
+    "  A. Event Overview — event reference, title, cause, responsible party, affected "
+    "works, status. A short table (Item, Detail) suits this.\n"
+    "  B. Detailed Narrative — a chronological, professional cause-and-effect account "
+    "built from the source documents. Do not merely restate the register entry.\n"
+    "  C. Chronology — table (Date, Party/Actor, Reference, Event/Action, "
+    "Consequence).\n"
+    "  D. Cause of Delay — the actual cause the evidence supports.\n"
+    "  E. Effect on Progress — affected activity, work area, dependency, downstream "
+    "effect, and any potential critical-path effect.\n"
+    "  F. Contractor's Actions / Mitigation — RFIs, notices, reminders, meetings, "
+    "mitigation, alternative works, resequencing, acceleration, where evidenced.\n"
+    "  G. Engineer / Employer Position — where the correspondence records an opposing "
+    "position, give it as its own statement, separate from the Contractor's.\n"
+    "  H. Contractual Basis — table (Clause, Title, Relevance, Evidence, "
+    "Compliance/Risk).\n"
+    "  I. Supporting Evidence — an `evidence` block naming the actual source documents "
+    "relied on for this event.\n"
+    "  J. Time Impact — claimed duration, assessed duration, critical/non-critical "
+    "status, the evidence supporting the duration, and the programme evidence status.\n"
+    "  K. Admissibility / Entitlement Assessment — classify as exactly one of: Strong, "
+    "Likely, At Risk, Not Demonstrated, Insufficient Evidence — and explain why. "
+    "Classify only as far as the evidence supports; prefer a weaker classification "
+    "with reasons over an overstated one.\n"
+)
+
+_CLAIM_TASK_ANALYSIS = (
+    "TASK — draft the analysis and conclusion: sections 6, 7 and 8.\n\n"
+    "6. DELAY ANALYSIS\n"
+    "   6.1 Introduction\n"
+    "   6.2 Delay Analysis Methodology — compare As-Planned vs As-Built, Impacted "
+    "As-Planned, Collapsed As-Built, and Time Impact Analysis / Window Analysis. For "
+    "each: its suitability here, the programme data it requires, and whether that data "
+    "is available. Then state the selected methodology and its limitations. You MUST "
+    "distinguish 'methodology selected/recommended' from 'analysis actually performed' "
+    "— never imply a Time Impact Analysis has been carried out when the programme "
+    "records to perform it have not been supplied.\n"
+    "   6.3 Window Periods — follow the PROGRAMME RECORDS status exactly. Where the "
+    "programme data supports windows, give each window its period, starting programme, "
+    "data date, delay events, impacted programme, updated impacted programme, longest "
+    "path, completion date before and after impact, delay attributable, concurrent "
+    "delay, Contractor contribution and a window conclusion. Where it does not, this "
+    "subsection is a single 'Missing evidence' statement naming what is required. "
+    "NEVER generate windows the source data does not support.\n"
+    "   6.4 Delay Analysis Findings — where programme data exists: the impacted "
+    "programme (insertion of the fragnet), the updated impacted programme (actual "
+    "progress incorporated), the longest path (driving activity, "
+    "predecessor/successor, event, resulting completion date), concurrent delay, and "
+    "any Contractor delay the evidence supports. Where it does not exist, record the "
+    "findings that CAN be drawn from the correspondence and event records, and label "
+    "clearly what remains unquantified.\n"
+    "   6.5 Summary — table (Window, Delay Event, Delay Days, Driving Activity, "
+    "Critical Path, Concurrent Delay, Completion Impact). Where windows could not be "
+    "constructed, present the per-event position instead and say so in the caption.\n\n"
+    "7. SUMMARY OF ENTITLEMENT\n"
+    "   Table (Delay Event, Event Description, Entitlement Days, Critical Path, "
+    "Status), then: total EOT entitlement, original completion date, revised "
+    "completion date, basis of entitlement, outstanding evidence, and any "
+    "reservations or qualifications. Where entitlement cannot be calculated from the "
+    "available evidence, state exactly: 'Final EOT entitlement cannot be reliably "
+    "quantified until the required programme records are provided.'\n\n"
+    "8. SCHEDULE OF ATTACHMENTS\n"
+    "   Table (No., Document, Type, Relevance) built ONLY from the supplied data-room "
+    "schedule. Do not list a document that was not supplied.\n"
+)
+
+# Three heading levels — section (6) → subsection (6.3) → part (A. Event Overview).
+# Structured outputs reject recursive schemas, so each level is named explicitly
+# rather than self-referenced.
+#
+# Every level is a `$ref` into `$defs`, which is load-bearing rather than tidiness:
+# the API compiles the schema into a grammar and rejects the request outright once
+# that grammar gets too large. Inlining the five-variant block union at all three
+# levels blows past the limit ("The compiled grammar is too large"); defining it
+# once and referencing it compiles fine and halves the schema.
 #
 # Each block variant is a fully-specified object rather than one loose shape with
 # optional keys: structured outputs require `additionalProperties: false` on every
@@ -1495,11 +2024,24 @@ def _block_variant(kind: str, **props) -> dict:
 
 _STRING_LIST = {"type": "array", "items": {"type": "string"}}
 
+
+def _ref(name: str) -> dict:
+    return {"$ref": f"#/$defs/{name}"}
+
+
 _CLAIM_BLOCK_SCHEMA = {
     "anyOf": [
         _block_variant("paragraph", text={"type": "string"}),
-        _block_variant("note", text={"type": "string"}),
         _block_variant("bullets", items=_STRING_LIST),
+        # The fact/position/analysis separation, carried in the data rather than
+        # left to the reader to infer from prose.
+        _block_variant(
+            "statement",
+            label={"enum": _STATEMENT_LABELS},
+            text={"type": "string"},
+        ),
+        # Source documents relied on — rendered as a distinct, checkable list.
+        _block_variant("evidence", items=_STRING_LIST),
         _block_variant(
             "table",
             caption={"type": "string"},
@@ -1509,39 +2051,68 @@ _CLAIM_BLOCK_SCHEMA = {
     ]
 }
 
-_CLAIM_OUTPUT_SCHEMA = {
+
+def _heading_level(**extra) -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "number": {"type": "string"},
+            "heading": {"type": "string"},
+            "blocks": {"type": "array", "items": _ref("block")},
+            **extra,
+        },
+        "required": ["number", "heading", "blocks", *extra],
+        "additionalProperties": False,
+    }
+
+
+# Only the definitions a schema actually reaches are included — an unused `$defs`
+# entry still counts toward the compiled grammar.
+_DEFS_EVENT = {
+    "block": _CLAIM_BLOCK_SCHEMA,
+    # Level 3: "A. Event Overview" inside a delay-event subsection.
+    "part": _heading_level(),
+}
+_DEFS_FULL = {
+    **_DEFS_EVENT,
+    "subsection": _heading_level(parts={"type": "array", "items": _ref("part")}),
+    "section": _heading_level(
+        subsections={"type": "array", "items": _ref("subsection")}
+    ),
+}
+
+# Pass 1 — front matter and the contractual case (sections 1–5).
+_CLAIM_FRONT_SCHEMA = {
     "type": "object",
+    "$defs": _DEFS_FULL,
     "properties": {
         "title": {"type": "string"},
         "reference": {"type": "string"},
-        "sections": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "number": {"type": "string"},
-                    "heading": {"type": "string"},
-                    "blocks": {"type": "array", "items": _CLAIM_BLOCK_SCHEMA},
-                    "subsections": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "number": {"type": "string"},
-                                "heading": {"type": "string"},
-                                "blocks": {"type": "array", "items": _CLAIM_BLOCK_SCHEMA},
-                            },
-                            "required": ["number", "heading", "blocks"],
-                            "additionalProperties": False,
-                        },
-                    },
-                },
-                "required": ["number", "heading", "blocks", "subsections"],
-                "additionalProperties": False,
-            },
-        },
+        "sections": {"type": "array", "items": _ref("section")},
     },
     "required": ["title", "reference", "sections"],
+    "additionalProperties": False,
+}
+
+# Pass 2 — one delay event. The caller assigns its 5.n number.
+_CLAIM_EVENT_SCHEMA = {
+    "type": "object",
+    "$defs": _DEFS_EVENT,
+    "properties": {
+        "heading": {"type": "string"},
+        "blocks": {"type": "array", "items": _ref("block")},
+        "parts": {"type": "array", "items": _ref("part")},
+    },
+    "required": ["heading", "blocks", "parts"],
+    "additionalProperties": False,
+}
+
+# Pass 3 — analysis, entitlement and attachments (sections 6–8).
+_CLAIM_ANALYSIS_SCHEMA = {
+    "type": "object",
+    "$defs": _DEFS_FULL,
+    "properties": {"sections": {"type": "array", "items": _ref("section")}},
+    "required": ["sections"],
     "additionalProperties": False,
 }
 
@@ -1644,7 +2215,63 @@ def _json_brief(label: str, payload, limit: int = 12000) -> str:
     return text
 
 
-async def generate_eot_claim(
+_PROGRAMME_EXTS = (".xer", ".mpp", ".xml")
+
+
+def _programme_status(project: dict, documents: list[dict]) -> str:
+    """State plainly what programme evidence exists — the single fact that decides
+    whether a windowed Time Impact Analysis can be performed at all.
+
+    Programme files can be uploaded to the data room, but nothing parses them yet,
+    so their activities, logic and critical path are unavailable even when a file
+    is present. The prompt has to say which of those two situations applies, so the
+    report neither invents windows nor claims a file is missing when it isn't.
+    """
+    named = (project or {}).get("baselineProgramme") or ""
+    files = [
+        d.get("name", "")
+        for d in documents or []
+        if d.get("type") in ("P6 XML", "MPP")
+        or (d.get("name") or "").lower().endswith(_PROGRAMME_EXTS)
+    ]
+
+    lines = [
+        "PROGRAMME RECORDS — this governs sections 3.4, 6.2, 6.3, 6.4 and 6.5.",
+        f"Baseline programme named on the project record: {named or '(none)'}",
+        f"Data date on the project record: {(project or {}).get('dataDate') or '(none)'}",
+    ]
+    if files:
+        lines.append(
+            "Programme files ARE present in the data room: "
+            + ", ".join(files[:20])
+            + ("" if len(files) <= 20 else f" (+{len(files) - 20} more)")
+        )
+        lines.append(
+            "However, these files have NOT been parsed — no activity, logic, float or "
+            "critical-path data has been extracted from them. You therefore know that "
+            "the files exist and what they are called, and nothing about their "
+            "contents. Do not describe activities, dates or a critical path from them."
+        )
+    else:
+        lines.append(
+            "No baseline, revised, updated or as-built programme has been supplied to "
+            "the data room."
+        )
+    lines.append(
+        "CONSEQUENCE: a windowed Time Impact Analysis CANNOT be performed and window "
+        "periods CANNOT be constructed. In 6.3 emit a single 'Missing evidence' "
+        "statement naming what is required (the baseline programme, the accepted "
+        "revisions, the progress updates with their data dates, and the as-built "
+        "programme, in P6 XER / P6 XML / MS Project form). In 6.2 you may still select "
+        "and justify a methodology, but state explicitly that it has not yet been "
+        "carried out. In 3.4 record the programme position as it actually stands. Any "
+        "day figures elsewhere in the claim are the assessed event impacts, not the "
+        "output of a critical-path analysis — say so wherever a total is given."
+    )
+    return "\n".join(lines)
+
+
+def build_claim_context(
     *,
     project: dict,
     events: list[dict],
@@ -1653,59 +2280,110 @@ async def generate_eot_claim(
     queries: list[dict] | None = None,
     admissibility: dict | None = None,
     methodology: dict | None = None,
-) -> dict:
-    """Draft the full EOT claim document from every project module.
+) -> str:
+    """The evidence base, rendered once and reused byte-identically by every pass.
 
-    Returns {title, reference, sections:[{number, heading, blocks, subsections}]}.
+    Sits in the cached system prefix, so a claim with twenty delay events pays for
+    this once rather than twenty-two times.
     """
     p = project or {}
     header = [
         f"Project: {p.get('name', '')}",
-        f"Reference: {p.get('code', '')}",
+        f"Project code: {p.get('code', '')}",
+        f"Location: {p.get('location', '')}",
         f"Contract standard: {p.get('standard', '')}",
         f"Employer: {p.get('employer', '')}",
         f"Engineer: {p.get('engineer', '')}",
         f"Contractor: {p.get('contractor', '')}",
-        f"Location: {p.get('location', '')}",
         f"Contract value: {p.get('value', '')} {p.get('currency', '')}",
         f"LOA / LPO reference: {p.get('loaRef', '')}",
-        f"Commencement: {p.get('commencementDate', '')}",
-        f"Baseline completion: {p.get('completionDate', '')}",
+        f"Commencement date: {p.get('commencementDate', '')}",
+        f"Original completion date: {p.get('completionDate', '')}",
         f"Time for completion (days): {p.get('timeForCompletionDays', '')}",
-        f"Data date: {p.get('dataDate', '')}",
-        f"Baseline programme: {p.get('baselineProgramme', '')}",
     ]
-    user_content = (
-        "PROJECT AND CONTRACT PARTICULARS\n" + "\n".join(header)
+    return (
+        "PROJECT AND CONTRACT PARTICULARS\n"
+        + "\n".join(header)
+        + "\n(An empty value above means the particular was not supplied — record it "
+        "as 'Not available in the supplied records.', never as a guess.)"
+        + "\n\n" + _programme_status(p, documents or [])
         + "\n\nDELAY EVENTS REGISTER\n" + _events_brief(events)
         + "\n\nPROJECT CLAUSE LIBRARY\n" + _clauses_brief(clauses or [])
-        + "\n\nADMISSIBILITY ASSESSMENT\n" + _json_brief("admissibility assessment", admissibility)
+        + "\n\nADMISSIBILITY ASSESSMENT\n"
+        + _json_brief("admissibility assessment", admissibility)
         + "\n\nDELAY ANALYSIS METHODOLOGY ASSESSMENT\n"
         + _json_brief("methodology assessment", methodology)
         + "\n\nQUERIES / RFI REGISTER\n" + _queries_brief(queries or [])
         + "\n\nDATA ROOM — SCHEDULE OF DOCUMENTS\n" + _documents_brief(documents or [])
-        + "\n\nNo baseline or updated programme has been parsed for this project, so "
-        "section 9 must be the 'note' placeholder described in your instructions."
-        + "\n\nDraft the Extension of Time claim now."
+        + "\n(These are the only documents you may cite. Anything not listed here does "
+        "not exist for the purposes of this claim.)"
     )
 
+
+async def _claim_call(*, context: str, task: str, schema: dict, max_tokens: int) -> dict:
+    """One structured pass over the shared claim context."""
     async with _client().messages.stream(
         model=MODEL,
-        max_tokens=32000,
+        max_tokens=max_tokens,
         thinking={"type": "adaptive"},
         system=[
-            {"type": "text", "text": _CLAIM_SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}
+            {"type": "text", "text": _CLAIM_HOUSE_RULES},
+            # Cache through the end of the evidence base: identical on every pass.
+            {"type": "text", "text": context, "cache_control": {"type": "ephemeral"}},
         ],
-        messages=[{"role": "user", "content": user_content}],
+        messages=[{"role": "user", "content": task}],
         output_config={
             "effort": "high",
-            "format": {"type": "json_schema", "schema": _CLAIM_OUTPUT_SCHEMA},
+            "format": {"type": "json_schema", "schema": schema},
         },
     ) as stream:
         response = await stream.get_final_message()
 
     payload = next((b.text for b in response.content if b.type == "text"), "")
     return json.loads(payload)
+
+
+async def generate_claim_front_matter(context: str) -> dict:
+    """Sections 1–5.1. Returns {title, reference, sections}."""
+    return await _claim_call(
+        context=context,
+        task=_CLAIM_TASK_FRONT,
+        schema=_CLAIM_FRONT_SCHEMA,
+        max_tokens=32000,
+    )
+
+
+async def generate_claim_delay_event(context: str, event: dict) -> dict:
+    """One delay-event subsection. Returns {heading, blocks, parts}."""
+    task = (
+        _CLAIM_TASK_EVENT
+        + "\n\nTHE EVENT TO DRAFT — use only this event's own record, plus the wider "
+        "context above for the contract, clauses and documents:\n"
+        + _events_brief([event])
+    )
+    return await _claim_call(
+        context=context,
+        task=task,
+        schema=_CLAIM_EVENT_SCHEMA,
+        max_tokens=16000,
+    )
+
+
+async def generate_claim_analysis(context: str, event_headings: list[str]) -> dict:
+    """Sections 6–8. Returns {sections}."""
+    drafted = "\n".join(f"- {h}" for h in event_headings) or "(none)"
+    task = (
+        _CLAIM_TASK_ANALYSIS
+        + "\n\nThe delay events already drafted as section 5 of this claim, which your "
+        "analysis and entitlement tables must cover and must not contradict:\n"
+        + drafted
+    )
+    return await _claim_call(
+        context=context,
+        task=task,
+        schema=_CLAIM_ANALYSIS_SCHEMA,
+        max_tokens=32000,
+    )
 
 
 # ── Client proposal generation (costed services proposal) ───────────────────
@@ -2205,3 +2883,448 @@ async def generate_admissibility_assessment(
 
     payload = next((b.text for b in response.content if b.type == "text"), "")
     return json.loads(payload)
+
+
+# ── Contractor admissibility scoring (Admissibility tab → Contractor) ───────
+# Scores the admissibility matrix's criteria against EACH delay event: is the
+# clause applicable to that event, did the Contractor comply, and what document
+# evidences it. Events are scored in batches; the data room and the matrix are
+# cached blocks so only the first batch pays for them.
+
+_CONTRACTOR_ADMISS_SYSTEM_PROMPT = (
+    "You are a forensic construction-claims analyst auditing a CONTRACTOR's "
+    "compliance with the contract's claim procedure. You are given (a) the project's "
+    "data room, (b) one or more DELAY EVENTS, and (c) an ADMISSIBILITY SCORING MATRIX "
+    "— a numbered list of requirements drawn from this contract's clauses, each with a "
+    "weightage. For EVERY delay event you are given, judge EVERY numbered requirement.\n\n"
+    "For each requirement return:\n"
+    "- 'applicable': 'Y' if that clause requirement genuinely bears on THIS delay event, "
+    "'N' if it does not. Judge applicability from the nature of the event and the "
+    "procedural route it took — e.g. requirements about a variation quotation are 'N' for "
+    "an event that involves no variation; a requirement that only bites once the Engineer "
+    "has requested something is 'N' when no such request was made; a requirement about an "
+    "interim claim is 'N' where the Contractor went straight to a final detailed claim. "
+    "Notice and detailed-claim requirements are normally 'Y' for every event.\n"
+    "- 'complied': 'Y' when the record shows the Contractor did what the requirement asks "
+    "— the right kind of document, from the right party, at the right time. Judge a "
+    "document by its substance, not its caption: a letter that gives notice of a claim IS "
+    "a notice, whether or not it quotes the clause number. Answer 'N' when the record "
+    "holds nothing of the kind, when what it holds is plainly late against a dated "
+    "deadline, or when it shows the step was not taken — NOT merely because you would "
+    "like fuller wording or further corroboration. 'I cannot verify the contents' is not "
+    "a finding of non-compliance. When 'applicable' is 'N', 'complied' MUST be 'N'.\n"
+    "- 'evidence': the document reference and date that proves compliance, written as the "
+    "documents themselves write it (e.g. 'OCC-SHSM-LTR-0191 dated 09 June 2024'). Where "
+    "something was done but imperfectly (late, incomplete), still answer 'Y' on the "
+    "substantive requirement it satisfies and say so here (e.g. 'Submitted, not within 14 "
+    "days. Refer OCC-SHSM-LTR-0162 dated 02 May 2024'). Leave it as an empty string when "
+    "the requirement is not applicable or when nothing was submitted. Keep it to one short "
+    "line.\n\n"
+    "Rules:\n"
+    "- A DEADLINE requirement (e.g. 'Notice within 14 days', 'Detailed claim within 28 "
+    "days') is 'complied': 'Y' ONLY if the document was actually submitted within that "
+    "period, counted from the event's start / the date the Contractor became aware. If it "
+    "was submitted late, answer 'N' and give the actual date in 'evidence'.\n"
+    "- NEVER invent a document reference, letter number or date. Cite only references that "
+    "appear in the record. Where the record genuinely holds nothing for a requirement, "
+    "'complied' is 'N' and 'evidence' says so briefly, e.g. 'No notice traced in the "
+    "record'.\n"
+    "- Judge each event ON ITS OWN facts and its own correspondence. Two events rarely "
+    "score identically.\n"
+    "- Return exactly one entry per numbered requirement per event, echoing its 'slNo'. Do "
+    "not renumber, skip or merge requirements.\n"
+    "- 'remark' is one sentence per event summarising the compliance position (e.g. what "
+    "was missed and why the claim is exposed)."
+)
+
+_CONTRACTOR_ROW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "slNo": {"type": "integer"},
+        "applicable": {"type": "string", "enum": ["Y", "N"]},
+        "complied": {"type": "string", "enum": ["Y", "N"]},
+        "evidence": {"type": "string"},
+    },
+    "required": ["slNo", "applicable", "complied", "evidence"],
+    "additionalProperties": False,
+}
+
+_CONTRACTOR_EVENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "eventRef": {"type": "string"},
+        "remark": {"type": "string"},
+        "rows": {"type": "array", "items": _CONTRACTOR_ROW_SCHEMA},
+    },
+    "required": ["eventRef", "remark", "rows"],
+    "additionalProperties": False,
+}
+
+_CONTRACTOR_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {"events": {"type": "array", "items": _CONTRACTOR_EVENT_SCHEMA}},
+    "required": ["events"],
+    "additionalProperties": False,
+}
+
+
+def _criteria_for_contractor(criteria: list[dict]) -> str:
+    """Render the flattened matrix criteria as a numbered list for the prompt.
+
+    `criteria` are in display order and already carry a 1-based 'slNo'.
+    """
+    lines = []
+    for c in criteria:
+        clause = (c.get("clauseLabel") or "").strip()
+        lines.append(
+            f"{c.get('slNo')}. [{c.get('category', '')}] Sub-clause {c.get('subClause', '')} — "
+            f"{c.get('description', '')} (weightage {c.get('weightage', 0)}"
+            + (f"; from {clause}" if clause else "")
+            + ")"
+        )
+    return "\n".join(lines)
+
+
+# Delay events are scored a few at a time so the output budget can't truncate the
+# JSON on projects with a long register and a large matrix.
+CONTRACTOR_ADMISS_BATCH_SIZE = int(os.getenv("CONTRACTOR_ADMISS_BATCH_SIZE", "3"))
+# Batches are independent once the register is cached, so they run concurrently;
+# this bounds the burst so a long register can't trip the org's rate limit.
+CONTRACTOR_ADMISS_CONCURRENCY = int(os.getenv("CONTRACTOR_ADMISS_CONCURRENCY", "6"))
+# Judging a register entry is a reading task, not a reasoning one: at 'medium'
+# the thinking tokens cost more than everything else in the run combined.
+CONTRACTOR_ADMISS_EFFORT = os.getenv("CONTRACTOR_ADMISS_EFFORT", "low")
+
+
+def provider_error_message(exc: anthropic.APIStatusError) -> str:
+    """A user-facing line for a provider error that keeps the API's own explanation.
+
+    A bare status code sends people hunting for a bug in the request: "400" reads
+    identically whether the prompt overran the context window, the account is out
+    of credit, or a parameter is malformed. The API says which — pass it through.
+    """
+    detail = ""
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict):
+            detail = str(error.get("message") or "").strip()
+    if not detail:
+        detail = str(getattr(exc, "message", "") or "").strip()
+    if not detail:
+        return f"AI provider error ({exc.status_code})."
+    return f"AI provider error ({exc.status_code}): {detail}"
+
+
+def _contractor_digest(documents: list[dict]) -> list[dict]:
+    """Render each document as one register entry for the contractor scoring.
+
+    Every batch of events has to re-read the whole data room, so what that room
+    costs decides what the tab costs. Sending each document's full text put this
+    project at 1.28M tokens — over the window, so the room had to be split into
+    parts that were then re-read once per batch. The analysis already stored for
+    each document at upload says what it is, who it is between, what it evidences
+    and on what dates, which is what a procedural-compliance judgement actually
+    turns on; at 179k tokens the whole room fits one cached prefix.
+
+    The trade is fidelity: a summary can place and date a letter but not reproduce
+    its body, so a deadline the register doesn't date cannot be tested from here.
+    `documents` is a list of {"name", "type", "analysis"} dicts.
+    """
+    entries: list[dict] = []
+    for d in documents:
+        analysis = d.get("analysis") or {}
+        name = d.get("name", "document")
+        seg = [f"- {name} [{analysis.get('document_type') or d.get('type') or 'Other'}]"]
+        title = (analysis.get("title") or "").strip()
+        if title:
+            seg.append(f" {title}")
+        seg.append("\n")
+        for label, key, cap in (("dates", "key_dates", 12), ("parties", "parties", 10)):
+            values = analysis.get(key) or []
+            if values:
+                seg.append(f"  {label}: {', '.join(str(v) for v in values[:cap])}\n")
+        for label, key in (("summary", "summary"), ("relevance", "relevance_to_claim")):
+            value = (analysis.get(key) or "").strip()
+            if value:
+                seg.append(f"  {label}: {value}\n")
+        points = analysis.get("key_points") or []
+        if points:
+            seg.append("  points: " + " | ".join(str(p) for p in points[:8]) + "\n")
+        if not analysis:
+            # Never analysed (or analysis failed) — say so rather than letting the
+            # model read a bare filename as though the document had been reviewed.
+            seg.append("  (not analysed — judge from the filename and type only)\n")
+        entries.append({"name": name, "text": "".join(seg)})
+    return entries
+
+
+def _yes(value) -> bool:
+    """True when an AI 'Y'/'N' field reads as yes."""
+    return str(value or "").upper().startswith("Y")
+
+
+def _merge_contractor_rows(into: dict, rows: list[dict]) -> None:
+    """Fold one part's verdicts for an event into the running row map (keyed by slNo).
+
+    A part sees only a slice of the data room, so its 'complied': 'N' means "not
+    evidenced in THIS slice", not "never done". Compliance is therefore
+    existential — a 'Y' from any part wins and brings its evidence line with it —
+    and so is applicability, which a part can miss when the correspondence that
+    makes the clause bite landed in another one.
+    """
+    for row in rows:
+        try:
+            sl = int(row.get("slNo"))
+        except (TypeError, ValueError):
+            continue
+        prev = into.get(sl)
+        if prev is None:
+            into[sl] = dict(row)
+            continue
+        if _yes(row.get("applicable")):
+            prev["applicable"] = "Y"
+        if _yes(row.get("complied")) and not _yes(prev.get("complied")):
+            prev["complied"] = "Y"
+            prev["evidence"] = row.get("evidence") or ""
+        elif not (prev.get("evidence") or "").strip():
+            prev["evidence"] = row.get("evidence") or ""
+
+
+def _merge_contractor_parts(parts: list[list[dict]]) -> list[dict]:
+    """Consolidate the same events scored separately against each data-room part.
+
+    Returns one entry per event, its rows merged per criterion and its remark
+    taken from the part that could evidence the most compliance — the part that
+    saw the correspondence, rather than one that saw none of it.
+    """
+    rows_by_ref: dict[str, dict] = {}
+    remark_by_ref: dict[str, tuple[int, str]] = {}
+    order: list[str] = []
+    for part in parts:
+        for res in part or []:
+            ref = res.get("eventRef") or ""
+            if ref not in rows_by_ref:
+                rows_by_ref[ref] = {}
+                remark_by_ref[ref] = (-1, "")
+                order.append(ref)
+            rows = res.get("rows") or []
+            _merge_contractor_rows(rows_by_ref[ref], rows)
+            remark = (res.get("remark") or "").strip()
+            score = sum(1 for r in rows if _yes(r.get("complied")))
+            if remark and score > remark_by_ref[ref][0]:
+                remark_by_ref[ref] = (score, remark)
+    return [
+        {
+            "eventRef": ref,
+            "remark": remark_by_ref[ref][1],
+            "rows": [rows_by_ref[ref][sl] for sl in sorted(rows_by_ref[ref])],
+        }
+        for ref in order
+    ]
+
+
+async def generate_contractor_admissibility(
+    *,
+    events: list[dict],
+    criteria: list[dict],
+    documents: list[dict],
+    project_name: str | None = None,
+    standard: str | None = None,
+    on_progress=None,
+) -> list[dict]:
+    """Score every matrix criterion against every delay event.
+
+    `criteria` is the flattened matrix (each with 'slNo', 'category', 'subClause',
+    'description', 'weightage', 'clauseLabel'); `documents` is a list of
+    {"name", "type", "text", "truncated"} dicts. Returns a list of
+    {"eventRef", "remark", "rows": [{slNo, applicable, complied, evidence}]} —
+    the caller maps each entry back onto its event and criterion.
+
+    `on_progress(done, total)` is called after each batch of events.
+
+    A data room that doesn't fit the model's context window is split into parts
+    and every batch of events is scored against each part, then consolidated.
+    Splitting never drops or truncates a document, so the only cost is that a
+    part which didn't see the correspondence reports 'complied': 'N' where
+    another part evidences it — which the consolidation resolves in favour of
+    the part that found the evidence.
+    """
+    ctx_bits = []
+    if project_name:
+        ctx_bits.append(f"Project: {project_name}")
+    if standard:
+        ctx_bits.append(f"Contract standard: {standard}")
+    header = " | ".join(ctx_bits)
+
+    criteria_text = _criteria_for_contractor(criteria)
+
+    batches = [
+        events[i : i + CONTRACTOR_ADMISS_BATCH_SIZE]
+        for i in range(0, len(events), max(1, CONTRACTOR_ADMISS_BATCH_SIZE))
+    ]
+
+    # Scoring reads the data-room REGISTER — one entry per document, built from the
+    # analysis already run at upload — rather than every document's full text. On
+    # this project that is 179k tokens against 1.28M, which is what makes the whole
+    # room fit in a single cached prefix: each batch of events then costs one cache
+    # read instead of seven full re-reads of the raw text.
+    doc_parts = _batch_by_token_budget(
+        _contractor_digest(documents), EXTRACTION_BATCH_TOKENS, _DIGEST_CHARS_PER_TOKEN
+    )
+    split = len(doc_parts) > 1
+    if split:
+        logger.info(
+            "Document register exceeds one request — scoring %d event(s) against %d "
+            "documents in %d parts",
+            len(events),
+            len(documents),
+            len(doc_parts),
+        )
+
+    def _docs_text(part: list[dict], index: int) -> str:
+        blocks = [header] if header else []
+        if split:
+            blocks.append(
+                f"\nNOTE: this is part {index + 1} of {len(doc_parts)} of the register. "
+                "The other parts are scored separately and merged afterwards, so a "
+                "requirement you cannot evidence here may well be evidenced there — "
+                "never conclude that the project as a whole is missing a document."
+            )
+        blocks.append(
+            "\n===== DATA ROOM REGISTER — one entry per document held in the data room =====\n"
+            "Each entry records a REAL document: its reference, type, date, parties and "
+            "what it contains. Those facts are established — a document listed here is "
+            "proven to exist and to have been issued as described. You cannot read the "
+            "document bodies and you do not need to; judge each requirement on what the "
+            "register shows.\n"
+            "Answer 'complied': 'Y' when an entry, or several together, show the "
+            "Contractor did what the requirement asks — the right kind of document, from "
+            "the right party, at the right time. Judge documents by their substance, not "
+            "their caption: a letter that gives notice of a claim IS a notice, whether or "
+            "not it cites the clause number. Do NOT answer 'N' merely because you cannot "
+            "see the full text, because the wording isn't quoted, or because you would "
+            "like further corroboration — the register is the record, and 'cannot be "
+            "verified' is not a finding of non-compliance.\n"
+            "Answer 'N' when the register holds nothing of the kind, when what it holds "
+            "is plainly late against a deadline the register itself dates, or when it "
+            "shows the step was not taken. Cite only references that appear here, and "
+            "where a deadline turns on a date the register does not give, say so in "
+            "'evidence' rather than assuming one."
+        )
+        blocks.extend(d["text"] for d in part)
+        return "\n".join(blocks)
+
+    docs_texts = [_docs_text(p, i) for i, p in enumerate(doc_parts)]
+    # The register is read back by every batch of events, so it is cached for an
+    # hour when a long run would otherwise let a 5-minute entry lapse mid-flight.
+    # One TTL for every breakpoint in the request: blocks are cached in order
+    # (tools, system, messages) and a 1h block may not follow a 5m one.
+    cache = {"type": "ephemeral", "ttl": "1h"} if len(batches) > 4 else {"type": "ephemeral"}
+
+    async def _run_batch(batch: list[dict], docs_text: str) -> list[dict]:
+        async with _client().messages.stream(
+            model=EXTRACTION_MODEL,
+            # One row per criterion per event, each with an evidence line — a small
+            # budget silently truncates the JSON mid-event. Well above what a batch
+            # needs: max_tokens is a ceiling, not a reservation, so the headroom is
+            # free and keeps a dense batch off the truncation cliff.
+            max_tokens=64000,
+            thinking={"type": "adaptive"},
+            system=[
+                {
+                    "type": "text",
+                    "text": _CONTRACTOR_ADMISS_SYSTEM_PROMPT,
+                    "cache_control": cache,
+                }
+            ],
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        # Cache breakpoints: the register and the matrix are the same
+                        # for every batch of events, so every batch after the first
+                        # reads them instead of re-sending them.
+                        {
+                            "type": "text",
+                            "text": docs_text,
+                            "cache_control": cache,
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "\n===== ADMISSIBILITY MATRIX — score EVERY numbered "
+                                "requirement below, for EVERY delay event =====\n"
+                                + criteria_text
+                            ),
+                            "cache_control": cache,
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "\n===== DELAY EVENTS TO SCORE (one 'events' entry per "
+                                "event below, keyed by eventRef) =====\n"
+                                + _events_brief(batch)
+                            ),
+                        },
+                    ],
+                }
+            ],
+            output_config={
+                "effort": CONTRACTOR_ADMISS_EFFORT,
+                "format": {"type": "json_schema", "schema": _CONTRACTOR_OUTPUT_SCHEMA},
+            },
+        ) as stream:
+            response = await stream.get_final_message()
+
+        payload = "".join(b.text for b in response.content if b.type == "text").strip()
+        if not payload:
+            logger.warning(
+                "Empty contractor-admissibility payload for %s (stop_reason=%s)",
+                [e.get("ref") for e in batch],
+                response.stop_reason,
+            )
+            return []
+        try:
+            return json.loads(payload).get("events", [])
+        except json.JSONDecodeError:
+            # One unparseable part shouldn't lose the whole batch — the rest of the
+            # register still scores and the merge keeps whatever it evidenced.
+            logger.warning(
+                "Unparseable contractor-admissibility output for %s",
+                [e.get("ref") for e in batch],
+                exc_info=True,
+            )
+            return []
+
+    async def _score(batch: list[dict]) -> list[dict]:
+        parts = await asyncio.gather(*(_run_batch(batch, t) for t in docs_texts))
+        return _merge_contractor_parts(list(parts))
+
+    done = 0
+
+    def _tick(n: int) -> None:
+        nonlocal done
+        done += n
+        if on_progress:
+            on_progress(done, len(events))
+
+    sem = asyncio.Semaphore(max(1, CONTRACTOR_ADMISS_CONCURRENCY))
+
+    async def _guarded(batch: list[dict]) -> list[dict]:
+        async with sem:
+            out = await _score(batch)
+        _tick(len(batch))
+        return out
+
+    if not batches:
+        return []
+    # The first batch alone writes the shared prefix to cache; the rest then run in
+    # parallel off that one write. Firing everything at once would have every
+    # request miss the cache and pay full price for the register — the batches are
+    # independent, so this is the only ordering constraint in the run.
+    results: list[dict] = await _score(batches[0])
+    _tick(len(batches[0]))
+    for scored in await asyncio.gather(*(_guarded(b) for b in batches[1:])):
+        results.extend(scored)
+    return results
