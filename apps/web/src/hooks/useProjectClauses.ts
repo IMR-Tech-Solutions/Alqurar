@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  clearClauseBookApi,
   createProjectClauseApi,
   deleteProjectClauseApi,
   extractProjectClausesApi,
@@ -115,6 +116,21 @@ export function useSelectClauseBook(projectId: string) {
       qc.setQueryData(clauseBookKey(projectId), res.bookId);
       qc.invalidateQueries({ queryKey: projectClausesKey(projectId) });
       // A new base book clears any prior PCC comparison state.
+      qc.setQueryData(pccStatusKey(projectId), { status: "idle" });
+    },
+  });
+}
+
+/** Unselect the base book; its copied clauses (and the PCC work on top of them)
+ * are removed from the project's library. */
+export function useClearClauseBook(projectId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => clearClauseBookApi(projectId),
+    onSuccess: () => {
+      qc.setQueryData(clauseBookKey(projectId), null);
+      qc.invalidateQueries({ queryKey: projectClausesKey(projectId) });
+      // Without a base book there is nothing left for a PCC comparison to show.
       qc.setQueryData(pccStatusKey(projectId), { status: "idle" });
     },
   });

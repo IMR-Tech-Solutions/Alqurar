@@ -267,6 +267,68 @@ export interface AdmissibilityAssessment {
   updatedAt: string | null;
 }
 
+// ── Contractor admissibility (Admissibility tab → Contractor admissibility) ─
+/** A yes/no verdict as the scoring sheet writes it. */
+export type YesNo = "Y" | "N";
+
+/** One scored requirement, snapshot from the admissibility matrix. */
+export interface ContractorCriterion {
+  id: string;
+  /** Clause the requirement comes from, e.g. "20". */
+  clauseRef: string;
+  /** That clause group's label in the matrix. */
+  clauseLabel: string;
+  /** Procedural stage, e.g. "Delay Notice". */
+  category: string;
+  /** Exact sub-clause, e.g. "20.1A(1)". */
+  subClause: string;
+  description: string;
+  /** Effective weight — the criterion's share of the 100 marks. */
+  weightage: number;
+}
+
+/** One criterion's verdict for one delay event. Score is derived, not stored. */
+export interface ContractorRow {
+  criterionId: string;
+  /** Does this clause requirement bear on this delay event? */
+  applicable: YesNo;
+  /** Did the Contractor actually satisfy it? */
+  complied: YesNo;
+  /** Document reference / remark evidencing the verdict. */
+  evidence: string;
+}
+
+/** One delay event's column of verdicts. */
+export interface ContractorEventScore {
+  eventId: string;
+  /** The delay event's reference, e.g. "DE-01". */
+  eventRef: string;
+  title: string;
+  /** One-line AI summary of the compliance position for this event. */
+  remarks: string;
+  rows: ContractorRow[];
+}
+
+export interface ContractorAdmissibilityContent {
+  criteria: ContractorCriterion[];
+  events: ContractorEventScore[];
+  summary: string;
+  /** The matrix version this was scored against — flags stale scoring. */
+  matrixUpdatedAt?: string | null;
+}
+
+/** The project's contractor scoring + its generation status. */
+export interface ContractorAdmissibilityAssessment {
+  projectId: string;
+  content: ContractorAdmissibilityContent | null;
+  model: string | null;
+  status: "" | "running" | "done" | "failed";
+  error: string | null;
+  updatedAt: string | null;
+  /** How many delay events have been scored so far (while running). */
+  progress?: { done: number; total: number } | null;
+}
+
 export interface EOTClaim {
   id: string;
   ref: string;

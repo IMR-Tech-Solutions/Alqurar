@@ -399,6 +399,43 @@ class AdmissibilityAssessment(Base):
         return d
 
 
+class ContractorAdmissibility(Base):
+    """The AI-generated CONTRACTOR ADMISSIBILITY scoring for a project
+    (Admissibility tab → Contractor admissibility). One row per project.
+
+    Each of the admissibility matrix's criteria is scored against EVERY delay
+    event: is the clause applicable to that event, did the Contractor comply, and
+    what evidence shows it. `content` snapshots the criteria (so the scoring
+    still renders if the matrix is later regenerated) alongside the per-event
+    judgements:
+    {criteria: [{id, clauseRef, clauseLabel, category, subClause, description,
+                 weightage}],
+     events:   [{eventId, eventRef, title, remarks,
+                 rows: [{criterionId, applicable, complied, evidence}]}],
+     summary, matrixUpdatedAt}
+    `weightage` is the criterion's effective weight (its % share of its clause's
+    marks), so the weightages across all criteria sum to 100. Score is derived,
+    not stored: weightage when applicable AND complied, else 0. `status` drives
+    background-generation polling (""/"running"/"done"/"failed")."""
+
+    __tablename__ = "contractor_admissibility"
+
+    projectId: Mapped[str] = mapped_column(String, primary_key=True)
+    content: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    model: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    status: Mapped[str] = mapped_column(String, default="")
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    createdAt: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    updatedAt: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+    _FIELDS = ("projectId", "content", "model", "status", "error", "createdAt", "updatedAt")
+
+    def to_dict(self) -> dict:
+        d = {f: getattr(self, f) for f in self._FIELDS}
+        d["status"] = self.status or ""
+        return d
+
+
 class ClientProposal(Base):
     """The AI-generated client-facing costed proposal for a proposal record
     (Proposals → New Proposal → Proposal tab). One row per proposal. `content`

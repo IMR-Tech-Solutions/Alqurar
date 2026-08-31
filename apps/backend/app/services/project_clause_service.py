@@ -182,6 +182,30 @@ def set_book_clauses(project_id: str, book: Dict, book_clauses: List[Dict]) -> i
         return len(rows)
 
 
+def clear_book_clauses(project_id: str) -> int:
+    """Unselect this project's base contract book.
+
+    Mirrors :func:`set_book_clauses`: the book-copied rows and any PCC additions
+    or amendments tied to them are removed, and the project's `clauseBookId` is
+    cleared. Manual and AI-extracted clauses are untouched. Returns how many rows
+    were removed.
+    """
+    with SessionLocal() as db:
+        removed = (
+            db.query(ProjectClause)
+            .filter(
+                ProjectClause.projectId == project_id,
+                ProjectClause.source.in_(("book", "pcc")),
+            )
+            .delete(synchronize_session=False)
+        )
+        p = db.get(Project, project_id)
+        if p:
+            p.clauseBookId = None
+        db.commit()
+        return removed or 0
+
+
 def list_book_sourced_clauses(project_id: str) -> List[Dict]:
     """This project's book-copied clauses (the base set a PCC can amend).
 

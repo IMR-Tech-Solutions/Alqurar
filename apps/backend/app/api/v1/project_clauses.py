@@ -29,6 +29,7 @@ from app.services import clause_extraction, contract_book_service, pcc_compariso
 from app.services.document_service import SELF_ID, create_document_with_next_id
 from app.services.project_clause_service import (
     add_clause,
+    clear_book_clauses,
     delete_clause,
     get_clause,
     get_clause_book_id,
@@ -88,6 +89,22 @@ async def patch_project_clause(
     if not updated:
         raise HTTPException(status_code=404, detail="Clause not found")
     return updated
+
+
+@router.delete("/{project_id}/clauses/book")
+async def clear_project_clause_book(
+    project_id: str,
+    _=Depends(get_current_user),
+    __=Depends(_MANAGE),
+):
+    """Unselect the base contract book.
+
+    Removes the clauses copied from it along with anything a PCC comparison added
+    or amended on top, and clears the comparison state. Clauses added by hand or
+    extracted from an uploaded contract are kept."""
+    removed = clear_book_clauses(project_id)
+    pcc_comparison.mark_idle(project_id)
+    return {"bookId": None, "removed": removed}
 
 
 @router.delete("/{project_id}/clauses/{clause_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -194,6 +211,11 @@ async def select_project_clause_book(
     # A new base book invalidates any earlier PCC comparison.
     pcc_comparison.mark_idle(project_id)
     return {"bookId": payload.bookId, "count": count}
+
+
+# Unselecting the book (DELETE .../clauses/book) is declared with the clause CRUD
+# routes above — it has to precede DELETE .../clauses/{clause_id}, which would
+# otherwise match first and take "book" for a clause id.
 
 
 # ── Particular Conditions of Contract (PCC) ─────────────────────────────────

@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
+  CalendarClock,
   CheckCircle2,
+  HardHat,
   Loader2,
   Plus,
   Save,
@@ -10,6 +12,9 @@ import {
   Trash2,
 } from "lucide-react";
 import { Card } from "@/components/ui/Card";
+import { Tabs } from "@/components/ui/Tabs";
+import { ContractorAdmissibilityTab } from "@/components/projects/ContractorAdmissibilityTab";
+import { DelayEventSummaryTab } from "@/components/projects/DelayEventSummaryTab";
 import { apiErrorMessage } from "@/api/client";
 import {
   useAdmissibility,
@@ -47,7 +52,29 @@ const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v));
 /** Effective weight = the criterion's % share of its clause's marks. */
 const effective = (c: AdmissibilityCriterion, marks: number) => (num(c.overallWtg) / 100) * num(marks);
 
+const SUB_TABS = [
+  { id: "matrix", label: "Admissibility matrix", icon: Scale },
+  { id: "contractor", label: "Contractor admissibility", icon: HardHat },
+  { id: "delay-summary", label: "Delay event summary", icon: CalendarClock },
+] as const;
+
+type SubTabId = (typeof SUB_TABS)[number]["id"];
+
 export function AdmissibilityTab({ projectId }: { projectId: string }) {
+  const [view, setView] = useState<SubTabId>("matrix");
+
+  return (
+    <div className="space-y-4">
+      <Tabs tabs={[...SUB_TABS]} active={view} onChange={(id) => setView(id as SubTabId)} />
+
+      {view === "matrix" && <AdmissibilityMatrixView projectId={projectId} />}
+      {view === "contractor" && <ContractorAdmissibilityTab projectId={projectId} />}
+      {view === "delay-summary" && <DelayEventSummaryTab projectId={projectId} />}
+    </div>
+  );
+}
+
+function AdmissibilityMatrixView({ projectId }: { projectId: string }) {
   const { data, isLoading } = useAdmissibility(projectId);
   const generate = useGenerateAdmissibility(projectId);
   const save = useSaveAdmissibility(projectId);

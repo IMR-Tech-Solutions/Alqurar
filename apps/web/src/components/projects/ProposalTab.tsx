@@ -1,44 +1,119 @@
+import { useMemo } from "react";
 import { jsPDF } from "jspdf";
-import { AlertTriangle, Download, FileSignature, Info, Loader2, Sparkles } from "lucide-react";
+import { AlertTriangle, Download, FileSignature, Loader2, Sparkles } from "lucide-react";
 import { Card } from "@/components/ui/Card";
 import { useGenerateProposal, useProposal } from "@/hooks/useProposal";
-import type { ClaimBlock, ClaimContent, ClaimSection } from "@/api/proposals";
+import type {
+  ClaimBlock,
+  ClaimContent,
+  ClaimSection,
+  ClaimStatementLabel,
+  ClaimSubsection,
+} from "@/api/proposals";
 import { formatDate } from "@/lib/utils";
 
-// ── PDF export ─────────────────────────────────────────────────────────────
-// Built in two passes: the first lays the body out on a throwaway document to
-// learn which page each section starts on, the second builds the real file with
-// a cover page and a contents page in front. Body layout doesn't depend on what
-// precedes it, so the recorded page numbers stay valid once shifted by the
-// number of front-matter pages.
+// ── Shared presentation ────────────────────────────────────────────────────
 
-const MARGIN = 48;
+type RGB = [number, number, number];
+
+const INK: RGB = [17, 24, 39];
+const NAVY: RGB = [15, 42, 76];
+const NAVY_MID: RGB = [30, 58, 95];
+const SLATE: RGB = [71, 85, 105];
+const FAINT: RGB = [120, 133, 150];
+const RULE: RGB = [203, 213, 225];
+const TABLE_HEAD: RGB = [241, 245, 249];
+
+/** Accent for each statement label, so fact and inference never look alike. */
+const STATEMENT_RGB: Record<ClaimStatementLabel, RGB> = {
+  Fact: [30, 58, 95],
+  "Contractor's position": [21, 94, 117],
+  "Engineer / Employer's position": [146, 64, 14],
+  Analysis: [91, 33, 182],
+  "Missing evidence": [180, 35, 24],
+  Assessment: [22, 101, 52],
+};
+
+/** Tailwind classes mirroring STATEMENT_RGB for the on-screen rendering. */
+const STATEMENT_CLASS: Record<ClaimStatementLabel, string> = {
+  Fact: "border-navy-400 bg-navy-50/60 text-navy-800",
+  "Contractor's position": "border-info bg-info-bg/50 text-info",
+  "Engineer / Employer's position": "border-amber-400 bg-amber-50 text-amber-800",
+  Analysis: "border-violet-400 bg-violet-50 text-violet-800",
+  "Missing evidence": "border-error bg-error-bg/50 text-error",
+  Assessment: "border-success bg-success-bg/50 text-success",
+};
+
+const subsectionsOf = (s: ClaimSection): ClaimSubsection[] => s.subsections ?? [];
+
+/**
+ * Number every table in document order.
+ *
+ * Keyed on block identity rather than position so the screen and the PDF agree:
+ * both walk the same object graph, so "Table 7" means the same table in each.
+ */
+function numberTables(doc: ClaimContent | null): Map<ClaimBlock, number> {
+  const map = new Map<ClaimBlock, number>();
+  let n = 0;
+  const visit = (blocks?: ClaimBlock[]) => {
+    for (const b of blocks ?? []) if (b.type === "table") map.set(b, ++n);
+  };
+  for (const section of doc?.sections ?? []) {
+    visit(section.blocks);
+    for (const sub of subsectionsOf(section)) {
+      visit(sub.blocks);
+      for (const part of sub.parts ?? []) visit(part.blocks);
+    }
+  }
+  return map;
+}
+
+const captionFor = (block: ClaimBlock, tables: Map<ClaimBlock, number>) => {
+  const n = tables.get(block);
+  const caption = block.type === "table" ? block.caption?.trim() : "";
+  if (!n) return caption ?? "";
+  return caption ? `Table ${n}: ${caption}` : `Table ${n}`;
+};
+
+// ── PDF export ─────────────────────────────────────────────────────────────
+// Laid out in two passes: the first measures the body on a throwaway document to
+// learn which page each heading starts on, the second builds the real file with a
+// cover and contents page in front and running headers applied once the total
+// page count is known. Page numbers are body-relative, so "page 12" in the
+// contents is the twelfth page of the claim proper.
+
+const MARGIN = 54;
 const BODY_SIZE = 9.5;
 const TABLE_SIZE = 8;
+const TOC_ROW_H = 14;
 
-type TocEntry = { number: string; heading: string; page: number; sub: boolean };
+type TocEntry = { number: string; heading: string; page: number; depth: 0 | 1 };
 
-/** Lays out title + body content, recording where each heading landed. */
-function renderBody(pdf: jsPDF, doc: ClaimContent): TocEntry[] {
+function renderBody(
+  pdf: jsPDF,
+  doc: ClaimContent,
+  tables: Map<ClaimBlock, number>,
+): TocEntry[] {
   const pageW = pdf.internal.pageSize.getWidth();
   const pageH = pdf.internal.pageSize.getHeight();
   const maxW = pageW - MARGIN * 2;
   const toc: TocEntry[] = [];
-  let y = MARGIN;
+  let y = MARGIN + 24; // leave room for the running header
 
   const ensure = (space: number) => {
-    if (y + space > pageH - MARGIN) {
+    if (y + space > pageH - MARGIN - 18) {
       pdf.addPage();
-      y = MARGIN;
+      y = MARGIN + 24;
     }
   };
 
   const write = (
     text: string,
     size: number,
-    style: "bold" | "normal",
+    style: "bold" | "normal" | "italic",
     gapAfter: number,
-    color: [number, number, number] = [17, 24, 39],
+    color: RGB = INK,
+    indent = 0,
   ) => {
     pdf.setFont("helvetica", style);
     pdf.setFontSize(size);
@@ -49,16 +124,16 @@ function renderBody(pdf: jsPDF, doc: ClaimContent): TocEntry[] {
         y += lineH * 0.5;
         continue;
       }
-      for (const line of pdf.splitTextToSize(raw, maxW) as string[]) {
+      for (const line of pdf.splitTextToSize(raw, maxW - indent) as string[]) {
         ensure(lineH);
-        pdf.text(line, MARGIN, y);
+        pdf.text(line, MARGIN + indent, y);
         y += lineH;
       }
     }
     y += gapAfter;
   };
 
-  /** Proportional column widths, weighted by the longest cell in each column. */
+  /** Column widths weighted by the longest cell, clamped so no column collapses. */
   const columnWidths = (columns: string[], rows: string[][]) => {
     const weights = columns.map((c, i) => {
       const longest = rows.reduce((m, r) => Math.max(m, (r[i] ?? "").length), c.length);
@@ -70,31 +145,32 @@ function renderBody(pdf: jsPDF, doc: ClaimContent): TocEntry[] {
 
   const drawTable = (caption: string, columns: string[], rows: string[][]) => {
     if (!columns.length) return;
-    if (caption) write(caption, 8.5, "bold", 2, [55, 65, 81]);
+    if (caption) write(caption, 8.5, "bold", 3, NAVY_MID);
 
     const widths = columnWidths(columns, rows);
     const pad = 4;
     const lineH = TABLE_SIZE * 1.35;
 
-    const drawRow = (cells: string[], bold: boolean) => {
-      pdf.setFont("helvetica", bold ? "bold" : "normal");
+    const drawRow = (cells: string[], header: boolean) => {
+      pdf.setFont("helvetica", header ? "bold" : "normal");
       pdf.setFontSize(TABLE_SIZE);
       // Wrap every cell first so the row height fits the tallest one.
-      const wrapped = cells.map((c, i) =>
-        pdf.splitTextToSize(String(c ?? ""), widths[i] - pad * 2) as string[],
+      const wrapped = cells.map(
+        (c, i) => pdf.splitTextToSize(String(c ?? ""), widths[i] - pad * 2) as string[],
       );
       const rowH = Math.max(...wrapped.map((w) => w.length)) * lineH + pad * 2;
       ensure(rowH);
 
-      if (bold) {
-        pdf.setFillColor(241, 245, 249);
+      if (header) {
+        pdf.setFillColor(...TABLE_HEAD);
         pdf.rect(MARGIN, y, maxW, rowH, "F");
       }
-      pdf.setDrawColor(203, 213, 225);
+      pdf.setDrawColor(...RULE);
+      pdf.setLineWidth(0.5);
       pdf.rect(MARGIN, y, maxW, rowH);
 
       let x = MARGIN;
-      pdf.setTextColor(17, 24, 39);
+      pdf.setTextColor(...INK);
       wrapped.forEach((lines, i) => {
         if (i > 0) pdf.line(x, y, x, y + rowH);
         lines.forEach((line, li) => {
@@ -107,116 +183,225 @@ function renderBody(pdf: jsPDF, doc: ClaimContent): TocEntry[] {
 
     drawRow(columns, true);
     rows.forEach((r) => drawRow(r, false));
-    y += 10;
+    y += 11;
   };
 
-  const drawBlocks = (blocks: ClaimBlock[]) => {
+  const drawStatement = (label: ClaimStatementLabel | undefined, text: string) => {
+    const key = (label ?? "Analysis") as ClaimStatementLabel;
+    const color = STATEMENT_RGB[key] ?? STATEMENT_RGB.Analysis;
+    const indent = 12;
+    const top = y;
+    write(key.toUpperCase(), 7.5, "bold", 2, color, indent);
+    write(text, BODY_SIZE, "normal", 8, INK, indent);
+    // Rule down the left edge, only where the statement stayed on one page.
+    if (y > top) {
+      pdf.setDrawColor(...color);
+      pdf.setLineWidth(1.6);
+      pdf.line(MARGIN + 3, top - 6, MARGIN + 3, Math.min(y - 6, pageH - MARGIN));
+      pdf.setLineWidth(0.5);
+    }
+  };
+
+  const drawBlocks = (blocks?: ClaimBlock[]) => {
     for (const b of blocks ?? []) {
       if (b.type === "paragraph") {
         if (b.text) write(b.text, BODY_SIZE, "normal", 8);
-      } else if (b.type === "note") {
-        if (b.text) write(b.text, BODY_SIZE, "normal", 8, [146, 64, 14]);
+      } else if (b.type === "statement") {
+        if (b.text) drawStatement(b.label, b.text);
       } else if (b.type === "bullets") {
         for (const item of b.items ?? []) write(`•  ${item}`, BODY_SIZE, "normal", 2);
         y += 6;
+      } else if (b.type === "evidence") {
+        write("Documents relied on", 8, "bold", 2, SLATE);
+        for (const item of b.items ?? []) write(`—  ${item}`, 8.5, "italic", 1, SLATE);
+        y += 8;
       } else if (b.type === "table") {
-        drawTable(b.caption ?? "", b.columns ?? [], b.rows ?? []);
+        drawTable(captionFor(b, tables), b.columns ?? [], b.rows ?? []);
       }
     }
   };
 
-  for (const s of doc.sections ?? []) {
-    ensure(60);
-    toc.push({ number: s.number, heading: s.heading, page: pdf.getNumberOfPages(), sub: false });
-    write(`${s.number}.  ${s.heading}`, 13, "bold", 8, [15, 42, 76]);
-    drawBlocks(s.blocks);
-
-    for (const sub of s.subsections ?? []) {
-      ensure(40);
-      toc.push({ number: sub.number, heading: sub.heading, page: pdf.getNumberOfPages(), sub: true });
-      write(`${sub.number}  ${sub.heading}`, 10.5, "bold", 6, [30, 58, 95]);
-      drawBlocks(sub.blocks);
+  doc.sections?.forEach((section, i) => {
+    // Every top-level section opens a page, as a printed claim would.
+    if (i > 0) {
+      pdf.addPage();
+      y = MARGIN + 24;
     }
-  }
+    toc.push({
+      number: section.number,
+      heading: section.heading,
+      page: pdf.getNumberOfPages(),
+      depth: 0,
+    });
+    write(`${section.number}.  ${section.heading}`, 14, "bold", 4, NAVY);
+    pdf.setDrawColor(...NAVY);
+    pdf.setLineWidth(1);
+    pdf.line(MARGIN, y - 6, pageW - MARGIN, y - 6);
+    pdf.setLineWidth(0.5);
+    y += 8;
+    drawBlocks(section.blocks);
+
+    for (const sub of subsectionsOf(section)) {
+      ensure(46);
+      toc.push({
+        number: sub.number,
+        heading: sub.heading,
+        page: pdf.getNumberOfPages(),
+        depth: 1,
+      });
+      write(`${sub.number}  ${sub.heading}`, 11, "bold", 6, NAVY_MID);
+      drawBlocks(sub.blocks);
+
+      for (const part of sub.parts ?? []) {
+        ensure(34);
+        write(`${part.number}.  ${part.heading}`, 9.5, "bold", 4, SLATE);
+        drawBlocks(part.blocks);
+      }
+    }
+  });
 
   return toc;
 }
 
-/** Cover page + contents, then the body. */
-function downloadClaimPdf(doc: ClaimContent, generatedAt?: string | null) {
-  // Pass 1 — measure where each heading falls.
-  const probe = new jsPDF({ unit: "pt", format: "a4" });
-  const entries = renderBody(probe, doc);
-
-  const pageH = probe.internal.pageSize.getHeight();
-  const tocRowH = 15;
-  const tocRowsPerPage = Math.floor((pageH - MARGIN * 2 - 40) / tocRowH);
-  const tocPages = Math.max(1, Math.ceil(entries.length / tocRowsPerPage));
-  const offset = 1 + tocPages; // cover + contents pages precede the body
-
-  // Pass 2 — the real document.
-  const pdf = new jsPDF({ unit: "pt", format: "a4" });
+/** Running header and footer on every body page, once the total is known. */
+function decorate(pdf: jsPDF, doc: ClaimContent, bodyStart: number) {
   const pageW = pdf.internal.pageSize.getWidth();
+  const pageH = pdf.internal.pageSize.getHeight();
+  const total = pdf.getNumberOfPages();
+  const bodyTotal = total - bodyStart + 1;
+
+  for (let p = bodyStart; p <= total; p++) {
+    pdf.setPage(p);
+    pdf.setFont("helvetica", "normal");
+    pdf.setFontSize(7.5);
+    pdf.setTextColor(...FAINT);
+
+    pdf.text(doc.title || "Extension of Time Claim", MARGIN, MARGIN - 12, {
+      maxWidth: pageW - MARGIN * 2 - 140,
+    });
+    if (doc.reference) {
+      pdf.text(doc.reference, pageW - MARGIN, MARGIN - 12, { align: "right" });
+    }
+    pdf.setDrawColor(...RULE);
+    pdf.setLineWidth(0.5);
+    pdf.line(MARGIN, MARGIN - 7, pageW - MARGIN, MARGIN - 7);
+
+    pdf.line(MARGIN, pageH - MARGIN + 4, pageW - MARGIN, pageH - MARGIN + 4);
+    pdf.text(
+      "AI-generated draft — verify against the contract and source documents before submission.",
+      MARGIN,
+      pageH - MARGIN + 16,
+    );
+    pdf.text(
+      `Page ${p - bodyStart + 1} of ${bodyTotal}`,
+      pageW - MARGIN,
+      pageH - MARGIN + 16,
+      { align: "right" },
+    );
+  }
+}
+
+function drawCover(pdf: jsPDF, doc: ClaimContent, generatedAt?: string | null) {
+  const pageW = pdf.internal.pageSize.getWidth();
+  const pageH = pdf.internal.pageSize.getHeight();
   const maxW = pageW - MARGIN * 2;
 
-  // Cover.
+  pdf.setFillColor(...NAVY);
+  pdf.rect(0, 0, pageW, 8, "F");
+
+  let y = 230;
   pdf.setFont("helvetica", "bold");
-  pdf.setFontSize(22);
-  pdf.setTextColor(15, 42, 76);
-  const titleLines = pdf.splitTextToSize(doc.title || "Extension of Time Claim", maxW) as string[];
-  let cy = 220;
-  titleLines.forEach((l) => {
-    pdf.text(l, MARGIN, cy);
-    cy += 28;
-  });
+  pdf.setFontSize(24);
+  pdf.setTextColor(...NAVY);
+  for (const line of pdf.splitTextToSize(
+    doc.title || "Extension of Time Claim",
+    maxW,
+  ) as string[]) {
+    pdf.text(line, MARGIN, y);
+    y += 30;
+  }
+
   if (doc.reference) {
     pdf.setFont("helvetica", "normal");
-    pdf.setFontSize(12);
-    pdf.setTextColor(71, 85, 105);
-    pdf.text(doc.reference, MARGIN, cy + 8);
-    cy += 30;
+    pdf.setFontSize(12.5);
+    pdf.setTextColor(...SLATE);
+    for (const line of pdf.splitTextToSize(doc.reference, maxW) as string[]) {
+      pdf.text(line, MARGIN, y + 6);
+      y += 18;
+    }
   }
-  pdf.setDrawColor(15, 42, 76);
+
+  pdf.setDrawColor(...NAVY);
   pdf.setLineWidth(2);
-  pdf.line(MARGIN, cy + 14, MARGIN + 120, cy + 14);
+  pdf.line(MARGIN, y + 22, MARGIN + 130, y + 22);
+  pdf.setLineWidth(0.5);
+
   pdf.setFont("helvetica", "normal");
   pdf.setFontSize(9.5);
-  pdf.setTextColor(100, 116, 139);
+  pdf.setTextColor(...FAINT);
   pdf.text(
     `AI-generated draft${generatedAt ? ` · ${formatDate(generatedAt)}` : ""}`,
     MARGIN,
-    cy + 42,
+    y + 50,
   );
   pdf.text(
-    "Review and verify against the contract and source documents before submission.",
+    "This draft is prepared from the documents supplied to the project data room.",
     MARGIN,
-    cy + 58,
+    pageH - MARGIN - 26,
   );
+  pdf.text(
+    "Review and verify against the contract and source records before submission.",
+    MARGIN,
+    pageH - MARGIN - 13,
+  );
+}
 
-  // Contents.
-  pdf.addPage();
+function drawContents(pdf: jsPDF, entries: TocEntry[]) {
+  const pageW = pdf.internal.pageSize.getWidth();
+  const pageH = pdf.internal.pageSize.getHeight();
+  const maxW = pageW - MARGIN * 2;
+
   pdf.setFont("helvetica", "bold");
-  pdf.setFontSize(14);
-  pdf.setTextColor(15, 42, 76);
-  pdf.text("CONTENTS", MARGIN, MARGIN + 10);
-  let ty = MARGIN + 38;
-  entries.forEach((e, i) => {
-    if (i > 0 && i % tocRowsPerPage === 0) {
-      pdf.addPage();
-      ty = MARGIN + 10;
-    }
-    pdf.setFont("helvetica", e.sub ? "normal" : "bold");
-    pdf.setFontSize(e.sub ? 9 : 9.5);
-    pdf.setTextColor(e.sub ? 71 : 17, e.sub ? 85 : 24, e.sub ? 105 : 39);
-    const label = `${e.number}${e.sub ? "" : "."}  ${e.heading}`;
-    pdf.text(label, MARGIN + (e.sub ? 18 : 0), ty, { maxWidth: maxW - 40 });
-    pdf.text(String(e.page + offset), pageW - MARGIN, ty, { align: "right" });
-    ty += tocRowH;
-  });
+  pdf.setFontSize(15);
+  pdf.setTextColor(...NAVY);
+  pdf.text("CONTENTS", MARGIN, MARGIN + 12);
+  let y = MARGIN + 44;
 
-  // Body.
+  for (const e of entries) {
+    if (y > pageH - MARGIN) {
+      pdf.addPage();
+      y = MARGIN + 12;
+    }
+    const top = e.depth === 0;
+    pdf.setFont("helvetica", top ? "bold" : "normal");
+    pdf.setFontSize(top ? 9.5 : 9);
+    pdf.setTextColor(...(top ? INK : SLATE));
+    const indent = top ? 0 : 20;
+    const label = `${e.number}${top ? "." : ""}  ${e.heading}`;
+    pdf.text(label, MARGIN + indent, y, { maxWidth: maxW - 46 - indent });
+    pdf.text(String(e.page), pageW - MARGIN, y, { align: "right" });
+    y += top ? TOC_ROW_H + 3 : TOC_ROW_H;
+  }
+}
+
+function downloadClaimPdf(
+  doc: ClaimContent,
+  tables: Map<ClaimBlock, number>,
+  generatedAt?: string | null,
+) {
+  // Pass 1 — measure the body to learn each heading's page.
+  const probe = new jsPDF({ unit: "pt", format: "a4" });
+  const entries = renderBody(probe, doc, tables);
+
+  // Pass 2 — the real document.
+  const pdf = new jsPDF({ unit: "pt", format: "a4" });
+  drawCover(pdf, doc, generatedAt);
   pdf.addPage();
-  renderBody(pdf, doc);
+  drawContents(pdf, entries);
+  pdf.addPage();
+  const bodyStart = pdf.getNumberOfPages();
+  renderBody(pdf, doc, tables);
+  decorate(pdf, doc, bodyStart);
 
   const safe =
     (doc.title || "EOT Claim").replace(/[^\w\-. ]+/g, "").trim().slice(0, 80) || "EOT Claim";
@@ -225,18 +410,30 @@ function downloadClaimPdf(doc: ClaimContent, generatedAt?: string | null) {
 
 // ── On-screen rendering ────────────────────────────────────────────────────
 
-function BlockView({ block }: { block: ClaimBlock }) {
+function BlockView({
+  block,
+  tables,
+}: {
+  block: ClaimBlock;
+  tables: Map<ClaimBlock, number>;
+}) {
   if (block.type === "paragraph") {
     return <p className="text-sm text-ink/90 leading-relaxed whitespace-pre-wrap">{block.text}</p>;
   }
-  if (block.type === "note") {
+
+  if (block.type === "statement") {
+    const key = (block.label ?? "Analysis") as ClaimStatementLabel;
+    const tone = STATEMENT_CLASS[key] ?? STATEMENT_CLASS.Analysis;
     return (
-      <div className="flex items-start gap-2 rounded-lg bg-warning-bg/60 px-3 py-2.5 text-xs text-warning">
-        <Info className="size-4 shrink-0 mt-px" />
-        <span className="leading-relaxed">{block.text}</span>
+      <div className={`border-l-[3px] rounded-r-md px-3 py-2 ${tone}`}>
+        <p className="text-[10px] font-bold uppercase tracking-wider opacity-80">{key}</p>
+        <p className="mt-0.5 text-sm leading-relaxed text-ink/90 whitespace-pre-wrap">
+          {block.text}
+        </p>
       </div>
     );
   }
+
   if (block.type === "bullets") {
     return (
       <ul className="list-disc pl-5 space-y-1">
@@ -248,10 +445,29 @@ function BlockView({ block }: { block: ClaimBlock }) {
       </ul>
     );
   }
+
+  if (block.type === "evidence") {
+    return (
+      <div className="rounded-lg border border-border bg-navy-50/30 px-3 py-2">
+        <p className="text-[11px] font-semibold text-muted uppercase tracking-wide">
+          Documents relied on
+        </p>
+        <ul className="mt-1 space-y-0.5">
+          {(block.items ?? []).map((it, i) => (
+            <li key={i} className="text-xs text-ink/80 italic">
+              — {it}
+            </li>
+          ))}
+        </ul>
+      </div>
+    );
+  }
+
+  const caption = captionFor(block, tables);
   return (
     <figure className="space-y-1.5">
-      {block.caption && (
-        <figcaption className="text-xs font-semibold text-navy-700">{block.caption}</figcaption>
+      {caption && (
+        <figcaption className="text-xs font-semibold text-navy-700">{caption}</figcaption>
       )}
       <div className="overflow-x-auto rounded-lg border border-border">
         <table className="w-full text-xs border-collapse">
@@ -284,22 +500,50 @@ function BlockView({ block }: { block: ClaimBlock }) {
   );
 }
 
-function SectionView({ section }: { section: ClaimSection }) {
+function Blocks({
+  blocks,
+  tables,
+}: {
+  blocks?: ClaimBlock[];
+  tables: Map<ClaimBlock, number>;
+}) {
+  return (
+    <>
+      {(blocks ?? []).map((b, i) => (
+        <BlockView key={i} block={b} tables={tables} />
+      ))}
+    </>
+  );
+}
+
+function SectionView({
+  section,
+  tables,
+}: {
+  section: ClaimSection;
+  tables: Map<ClaimBlock, number>;
+}) {
   return (
     <section className="space-y-3">
-      <h2 className="text-sm font-bold uppercase tracking-wide text-navy-800 pb-1.5 border-b border-border">
+      <h2 className="text-sm font-bold uppercase tracking-wide text-navy-800 pb-1.5 border-b-2 border-navy-800">
         {section.number}. {section.heading}
       </h2>
-      {(section.blocks ?? []).map((b, i) => (
-        <BlockView key={i} block={b} />
-      ))}
-      {(section.subsections ?? []).map((sub, i) => (
-        <div key={i} className="space-y-2 pt-1">
+      <Blocks blocks={section.blocks} tables={tables} />
+
+      {subsectionsOf(section).map((sub, i) => (
+        <div key={i} className="space-y-2 pt-2">
           <h3 className="text-[13px] font-semibold text-navy-700">
             {sub.number} {sub.heading}
           </h3>
-          {(sub.blocks ?? []).map((b, bi) => (
-            <BlockView key={bi} block={b} />
+          <Blocks blocks={sub.blocks} tables={tables} />
+
+          {(sub.parts ?? []).map((part, pi) => (
+            <div key={pi} className="space-y-2 pl-3 border-l border-border">
+              <h4 className="text-xs font-semibold text-muted uppercase tracking-wide">
+                {part.number}. {part.heading}
+              </h4>
+              <Blocks blocks={part.blocks} tables={tables} />
+            </div>
           ))}
         </div>
       ))}
@@ -310,7 +554,8 @@ function SectionView({ section }: { section: ClaimSection }) {
 /**
  * EOT Report tab — the AI-drafted Extension of Time claim, assembled from every
  * project module: delay events, the Clause Library, admissibility, methodology,
- * queries and the data room.
+ * queries and the data room. Generation runs in several passes and the document
+ * is rendered as it builds, so sections appear before the whole claim is done.
  */
 export function ProposalTab({ projectId }: { projectId: string }) {
   const { data: proposal, isLoading } = useProposal(projectId);
@@ -319,6 +564,7 @@ export function ProposalTab({ projectId }: { projectId: string }) {
   const running = proposal?.status === "running" || generate.isPending;
   const failed = proposal?.status === "failed";
   const doc = proposal?.content ?? null;
+  const tables = useMemo(() => numberTables(doc), [doc]);
 
   function handleGenerate() {
     if (doc && !window.confirm("Regenerate the EOT report? This replaces the current draft.")) return;
@@ -337,10 +583,10 @@ export function ProposalTab({ projectId }: { projectId: string }) {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          {doc && !running && (
+          {doc && (
             <button
               className="btn btn-outline btn-sm"
-              onClick={() => downloadClaimPdf(doc, proposal?.updatedAt)}
+              onClick={() => downloadClaimPdf(doc, tables, proposal?.updatedAt)}
             >
               <Download className="size-4" /> Download PDF
             </button>
@@ -359,6 +605,16 @@ export function ProposalTab({ projectId }: { projectId: string }) {
         </div>
       )}
 
+      {running && doc && (
+        <div className="flex items-start gap-2 rounded-lg bg-navy-50/70 px-3 py-2.5 text-xs text-navy-700">
+          <Loader2 className="size-4 shrink-0 mt-px animate-spin" />
+          <span>
+            Still drafting — sections appear here as they are completed. The delay events and the
+            analysis are written last.
+          </span>
+        </div>
+      )}
+
       {isLoading ? (
         <Card className="p-10 text-center text-sm text-muted inline-flex items-center justify-center gap-2 w-full">
           <Loader2 className="size-4 animate-spin" /> Loading…
@@ -370,8 +626,8 @@ export function ProposalTab({ projectId }: { projectId: string }) {
           </span>
           <h3 className="mt-3 font-semibold text-ink">Drafting the EOT report with AI…</h3>
           <p className="mt-1 text-sm text-muted max-w-md mx-auto">
-            Claude is working through the delay events, clauses, admissibility and queries. A full
-            report takes a few minutes.
+            Claude is working through the contract, clauses and admissibility first, then each delay
+            event in turn. The first sections will appear here shortly.
           </p>
         </Card>
       ) : !doc ? (
@@ -391,7 +647,7 @@ export function ProposalTab({ projectId }: { projectId: string }) {
       ) : (
         <Card className="p-0 overflow-hidden">
           <article className="px-6 py-6 sm:px-10 sm:py-8 max-w-4xl mx-auto">
-            <header className="border-b border-border pb-4 mb-6">
+            <header className="border-b-2 border-navy-800 pb-4 mb-7">
               <p className="text-[11px] uppercase tracking-wide text-faint inline-flex items-center gap-1.5">
                 <Sparkles className="size-3.5 text-amber-500" /> AI-generated draft
                 {proposal?.updatedAt ? ` · ${formatDate(proposal.updatedAt)}` : ""}
@@ -400,13 +656,13 @@ export function ProposalTab({ projectId }: { projectId: string }) {
               {doc.reference && <p className="mt-1 text-sm text-muted">{doc.reference}</p>}
             </header>
 
-            <div className="space-y-8">
+            <div className="space-y-9">
               {(doc.sections ?? []).map((s, i) => (
-                <SectionView key={i} section={s} />
+                <SectionView key={i} section={s} tables={tables} />
               ))}
             </div>
 
-            <p className="mt-8 pt-4 border-t border-border text-[11px] text-faint">
+            <p className="mt-9 pt-4 border-t border-border text-[11px] text-faint">
               AI-generated draft{proposal?.model ? ` · ${proposal.model}` : ""}. Review and verify
               against the contract and source documents before submission.
             </p>

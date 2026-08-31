@@ -132,6 +132,17 @@ export async function selectClauseBookApi(
   return data;
 }
 
+/** Unselect the base contract book — its copied clauses (and anything the PCC
+ * comparison added or amended on top) are removed from the project's library. */
+export async function clearClauseBookApi(
+  projectId: string,
+): Promise<{ bookId: null; removed: number }> {
+  const { data } = await api.delete<{ bookId: null; removed: number }>(
+    `/projects/${projectId}/clauses/book`,
+  );
+  return data;
+}
+
 /** Upload the project's Particular Conditions; the backend compares them against
  * the base book's clauses in the background. Poll {@link getPccStatusApi}. */
 export async function uploadPccApi(

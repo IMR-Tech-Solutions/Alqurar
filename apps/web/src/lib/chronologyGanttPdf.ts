@@ -6,7 +6,14 @@
 // per-party duration strips, the month/year axis with one bar per chronology
 // step, and a legend. Long registers paginate with the axis header repeated.
 import { jsPDF } from "jspdf";
-import { ACTOR_COLORS, buildGanttModel, dayLabel, eventNumber, type GanttModel } from "@/lib/chronologyGantt";
+import {
+  ACTOR_COLORS,
+  buildGanttModel,
+  captionPlacement,
+  dayLabel,
+  eventNumber,
+  type GanttModel,
+} from "@/lib/chronologyGantt";
 import type { ProjectDelayEvent } from "@/types";
 
 type RGB = [number, number, number];
@@ -226,18 +233,27 @@ export function downloadChronologyGanttPdf(
         pdf.rect(barX, cy - 2.6, barW, 5.2, "F");
       }
 
-      // Date captions — outside the bar where there is room
+      // Date captions — outside the bar where there is room, inside it (in white)
+      // where there isn't, so the two never land on the same spot.
       pdf.setFontSize(5.2);
       setFont(false, false);
-      setColor(color);
-      const sLab = row.startLabel;
-      const sW = pdf.getTextWidth(sLab);
-      if (barX - sW - 2 > gridX) pdf.text(sLab, barX - sW - 2, cy + 1.8);
-      else pdf.text(sLab, barX + barW + 2, cy + 1.8);
-      if (!row.milestone) {
-        const eLab = row.endLabel;
-        const ex = barX + barW + 2;
-        if (ex + pdf.getTextWidth(eLab) < M + contentW) pdf.text(eLab, ex, cy + 1.8);
+      const startW = pdf.getTextWidth(row.startLabel);
+      const endW = pdf.getTextWidth(row.endLabel);
+      const caps = captionPlacement(row, timelineW, Math.max(startW, endW), 2);
+      const capY = cy + 1.8;
+      if (caps.start !== "hidden") {
+        setColor(caps.start === "inside" ? WHITE : color);
+        const sx =
+          caps.start === "before"
+            ? barX - startW - 2
+            : caps.start === "after"
+              ? barX + barW + 2
+              : barX + 2;
+        pdf.text(row.startLabel, sx, capY);
+      }
+      if (caps.end !== "hidden") {
+        setColor(caps.end === "inside" ? WHITE : color);
+        pdf.text(row.endLabel, caps.end === "after" ? barX + barW + 2 : barX + barW - endW - 2, capY);
       }
       y += ROW_H;
     }
