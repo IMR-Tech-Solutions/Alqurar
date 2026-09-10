@@ -87,6 +87,13 @@ export type DelayCause =
 
 export type NoticeStatus = "Compliant" | "Due Soon" | "Overdue" | "Missed";
 
+/**
+ * The contract form a project / proposal is written against.
+ *
+ * The literals are the common standard forms (kept for autocomplete and for the
+ * legacy pickers), but a project's standard can also be the name of a contract
+ * book uploaded to the Knowledge Center — so any string is accepted.
+ */
 export type ContractStandard =
   | "FIDIC Red 1999"
   | "FIDIC Red 2017"
@@ -94,7 +101,9 @@ export type ContractStandard =
   | "FIDIC Silver 2017"
   | "NEC4"
   | "CPWD"
-  | "Bespoke";
+  | "Bespoke"
+  // eslint-disable-next-line @typescript-eslint/ban-types
+  | (string & {});
 
 export type RiskLevel = "Low" | "Moderate" | "High";
 

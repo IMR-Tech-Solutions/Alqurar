@@ -1,26 +1,27 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { ArrowLeft, FileSignature, Loader2, Save, UserPlus } from "lucide-react";
+import { ArrowLeft, BookOpen, FileSignature, Loader2, Save, UserPlus } from "lucide-react";
 import { apiErrorMessage } from "@/api/client";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { useCreateProject, useProjectById, useProjectsQuery, type ProjectDetails } from "@/store/projects";
 import { useUsersQuery } from "@/hooks/useUsers";
 import { useAssignClients } from "@/hooks/useAssignments";
 import { useClientProfiles } from "@/store/clientProfiles";
+import { useBooksQuery } from "@/hooks/useKnowledge";
+import { useClauseBookQuery, useSelectClauseBook } from "@/hooks/useProjectClauses";
+import { selectClauseBookApi } from "@/api/projectClauses";
 import { CLIENT_ROLE } from "@/lib/roles";
 import { PROPOSAL_TYPES, proposalTypeDef, type ProposalType } from "@/lib/proposalTypes";
+import type { ContractBook } from "@/api/knowledge";
 import type { ContractStandard, ManagedUser } from "@/types";
 
-const STANDARDS: ContractStandard[] = [
-  "FIDIC Red 2017",
-  "FIDIC Red 1999",
-  "FIDIC Yellow 2017",
-  "FIDIC Silver 2017",
-  "NEC4",
-  "CPWD",
-  "Bespoke",
-];
 const CURRENCIES = ["OMR", "AED", "USD", "SAR", "QAR", "KWD", "BHD"];
+
+/** A book's display name — "FIDIC Red Book 2017" — used as the proposal's
+ *  contract standard once the book is picked. */
+function bookLabel(b: ContractBook): string {
+  return b.edition ? `${b.name} ${b.edition}`.trim() : b.name;
+}
 
 /**
  * New Proposal — captures the minimum needed to start a proposal, then opens its
@@ -53,14 +54,40 @@ export function NewProposalPage() {
     return company ? `${company} — ${u.name}` : `${u.name} (${u.email})`;
   };
 
+  // Contract books uploaded to the Knowledge Center — the proposal's contract
+  // standard is one of these, so the delay-event analysis cites its real clauses
+  // rather than a hard-coded form name.
+  const { data: books = [], isLoading: booksLoading } = useBooksQuery();
+  // Only a fully extracted book can be used: its clauses are what get copied into
+  // the proposal's clause library.
+  const readyBooks = useMemo(
+    () => books.filter((b) => b.status === "done" && b.clauseCount > 0),
+    [books],
+  );
+  const pendingBooks = useMemo(
+    () => books.filter((b) => b.status === "pending" || b.status === "processing"),
+    [books],
+  );
+
   const [name, setName] = useState("");
   const [clientId, setClientId] = useState("");
   const [client, setClient] = useState("");
   const [proposalType, setProposalType] = useState<ProposalType>("claims_support");
-  const [standard, setStandard] = useState<ContractStandard>("FIDIC Red 2017");
+  const [bookId, setBookId] = useState("");
   const [currency, setCurrency] = useState("OMR");
   const [error, setError] = useState("");
+  const [bookError, setBookError] = useState("");
   const [submitError, setSubmitError] = useState("");
+
+  const selectedBook = readyBooks.find((b) => b.id === bookId);
+  // The stored `standard` string is the chosen book's name — it is what the AI
+  // prompt and the generated proposal quote as the contract form.
+  const standard = (selectedBook ? bookLabel(selectedBook) : "") as ContractStandard;
+
+  // The book already attached to this proposal (edit mode), used to pre-select
+  // the picker and to skip a needless re-copy when it hasn't changed.
+  const { data: existingBookId } = useClauseBookQuery(editing ? editId! : "");
+  const selectBook = useSelectClauseBook(editId ?? "");
 
   // In edit mode, pre-fill the form from the existing proposal once it loads.
   const seeded = useRef(false);
@@ -70,9 +97,16 @@ export function NewProposalPage() {
     setName(existing.name ?? "");
     setClient(existing.employer ?? "");
     setProposalType(((existing.proposalType as ProposalType) || "claims_support"));
-    setStandard(((existing.standard as ContractStandard) || "FIDIC Red 2017"));
     setCurrency(existing.currency || "OMR");
   }, [editing, existing]);
+
+  // The attached book arrives from its own request — seed the picker when it does.
+  const seededBook = useRef(false);
+  useEffect(() => {
+    if (!editing || seededBook.current || !existingBookId) return;
+    seededBook.current = true;
+    setBookId(existingBookId);
+  }, [editing, existingBookId]);
 
   const typeDef = proposalTypeDef(proposalType);
 
@@ -84,7 +118,7 @@ export function NewProposalPage() {
     if (u) setClient(companyOf(u) ?? u.name);
   }
 
-  const busy = createProject.isPending || assignClients.isPending;
+  const busy = createProject.isPending || assignClients.isPending || selectBook.isPending;
 
   function submit(e: FormEvent) {
     e.preventDefault();
@@ -92,7 +126,13 @@ export function NewProposalPage() {
       setError("Proposal name is required.");
       return;
     }
+    if (!bookId) {
+      setError("");
+      setBookError("Choose the contract book this proposal is written against.");
+      return;
+    }
     setError("");
+    setBookError("");
     setSubmitError("");
 
     // ── Edit mode: upsert the existing proposal, preserving its id/code/kind/etc. ──
@@ -106,7 +146,19 @@ export function NewProposalPage() {
         currency,
       };
       createProject.mutate(updated, {
-        onSuccess: () => navigate(`/proposals/${existing.id}`),
+        onSuccess: async () => {
+          // Re-copy the book's clauses only when the analyst picked a different
+          // book — re-selecting the same one would discard PCC work for nothing.
+          if (bookId !== existingBookId) {
+            try {
+              await selectBook.mutateAsync(bookId);
+            } catch (err) {
+              setSubmitError(apiErrorMessage(err, "Could not attach the contract book's clauses."));
+              return;
+            }
+          }
+          navigate(`/proposals/${existing.id}`);
+        },
         onError: (err) => setSubmitError(apiErrorMessage(err, "Could not save the proposal — is the backend running?")),
       });
       return;
@@ -134,6 +186,14 @@ export function NewProposalPage() {
 
     createProject.mutate(proposal, {
       onSuccess: async () => {
+        // Copy the chosen book's clauses into the proposal's clause library —
+        // this is the clause set the AI cites when it identifies delay events.
+        try {
+          await selectClauseBookApi(id, bookId);
+        } catch (err) {
+          setSubmitError(apiErrorMessage(err, "Could not attach the contract book's clauses."));
+          return;
+        }
         // Link the selected existing client to the proposal, if one was chosen.
         if (clientId) {
           try {
@@ -264,10 +324,31 @@ export function NewProposalPage() {
             </div>
             <div className="grid sm:grid-cols-3 gap-5">
               <div className="sm:col-span-2">
-                <label className="label" htmlFor="standard">Contract standard</label>
-                <select id="standard" className="input" value={standard} onChange={(e) => setStandard(e.target.value as ContractStandard)}>
-                  {STANDARDS.map((s) => <option key={s} value={s}>{s}</option>)}
+                <label className="label" htmlFor="bookId">Contract book</label>
+                <select
+                  id="bookId"
+                  className="input"
+                  value={bookId}
+                  onChange={(e) => {
+                    setBookId(e.target.value);
+                    setBookError("");
+                  }}
+                  disabled={booksLoading}
+                >
+                  <option value="">
+                    {booksLoading
+                      ? "Loading contract books…"
+                      : readyBooks.length === 0
+                        ? "No contract books available"
+                        : "Select a contract book…"}
+                  </option>
+                  {readyBooks.map((b) => (
+                    <option key={b.id} value={b.id}>
+                      {bookLabel(b)} — {b.clauseCount} clause{b.clauseCount === 1 ? "" : "s"}
+                    </option>
+                  ))}
                 </select>
+                {bookError && <p className="mt-1 text-xs text-error">{bookError}</p>}
               </div>
               <div>
                 <label className="label" htmlFor="currency">Currency</label>
@@ -276,6 +357,39 @@ export function NewProposalPage() {
                 </select>
               </div>
             </div>
+
+            {/* What the chosen book does for the proposal, and how to get one when
+                the Knowledge Center is empty or still extracting. */}
+            {selectedBook ? (
+              <div className="flex items-start gap-2 rounded-lg border border-border bg-navy-50/40 px-3 py-2.5 text-xs">
+                <BookOpen className="size-4 shrink-0 mt-px text-navy-600" />
+                <span className="text-muted">
+                  <span className="font-semibold text-ink">{bookLabel(selectedBook)}</span>
+                  {selectedBook.publisher ? ` · ${selectedBook.publisher}` : ""} — its{" "}
+                  {selectedBook.clauseCount} extracted clauses are copied into this proposal's clause
+                  library, and the AI cites them when it identifies the delay events.
+                </span>
+              </div>
+            ) : !booksLoading && readyBooks.length === 0 ? (
+              <div className="flex items-start gap-2 rounded-lg border border-border bg-warning-bg/50 px-3 py-2.5 text-xs text-warning">
+                <BookOpen className="size-4 shrink-0 mt-px" />
+                <span>
+                  {pendingBooks.length > 0
+                    ? `${pendingBooks.length} book${pendingBooks.length === 1 ? " is" : "s are"} still being read by the AI — its clauses will be selectable once extraction finishes. `
+                    : "No contract books have been uploaded yet. "}
+                  <Link to="/knowledge" className="font-semibold underline">
+                    Open the Knowledge Center
+                  </Link>{" "}
+                  to upload one.
+                </span>
+              </div>
+            ) : (
+              <p className="text-xs text-faint">
+                The contract standard this proposal is written against — picked from the{" "}
+                <Link to="/knowledge" className="underline">Knowledge Center</Link>. Its clauses drive
+                the delay-event analysis.
+              </p>
+            )}
           </div>
         </Card>
 

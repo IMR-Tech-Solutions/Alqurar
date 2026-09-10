@@ -1,22 +1,23 @@
-import { useRef, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { ArrowLeft, FolderKanban, Loader2, Paperclip, UploadCloud, X } from "lucide-react";
+import { ArrowLeft, BookOpen, FolderKanban, Loader2, Paperclip, UploadCloud, X } from "lucide-react";
 import { apiErrorMessage } from "@/api/client";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { cn } from "@/lib/utils";
 import { useAllProjects, useCreateProject, type ProjectDetails } from "@/store/projects";
+import { useBooksQuery } from "@/hooks/useKnowledge";
+import { useClauseBookQuery, useSelectClauseBook } from "@/hooks/useProjectClauses";
+import { selectClauseBookApi } from "@/api/projectClauses";
+import type { ContractBook } from "@/api/knowledge";
 import type { ContractStandard } from "@/types";
 
-const STANDARDS: ContractStandard[] = [
-  "FIDIC Red 2017",
-  "FIDIC Red 1999",
-  "FIDIC Yellow 2017",
-  "FIDIC Silver 2017",
-  "NEC4",
-  "CPWD",
-  "Bespoke",
-];
 const CURRENCIES = ["OMR", "AED", "USD", "SAR", "QAR", "KWD", "BHD"];
+
+/** A book's display name — "FIDIC Red Book 2017" — used as the project's
+ *  contract standard once the book is picked. */
+function bookLabel(b: ContractBook): string {
+  return b.edition ? `${b.name} ${b.edition}`.trim() : b.name;
+}
 
 const STEP_IDS = ["basics", "contract", "dates", "baseline"] as const;
 type StepId = (typeof STEP_IDS)[number];
@@ -48,8 +49,33 @@ export function CreateProjectPage() {
   const [engineer, setEngineer] = useState(editing?.engineer ?? "");
   const [contractor, setContractor] = useState(editing?.contractor ?? "");
 
-  // Contract
-  const [standard, setStandard] = useState<ContractStandard>((editing?.standard as ContractStandard) ?? "FIDIC Red 2017");
+  // Contract — the standard comes from a Knowledge-Center book, so the project's
+  // clause library, delay-event analysis and EOT claim all cite its real clauses.
+  const { data: books = [], isLoading: booksLoading } = useBooksQuery();
+  // Only a fully extracted book can be used: its clauses are what get copied in.
+  const readyBooks = useMemo(
+    () => books.filter((b) => b.status === "done" && b.clauseCount > 0),
+    [books],
+  );
+  const pendingBooks = useMemo(
+    () => books.filter((b) => b.status === "pending" || b.status === "processing"),
+    [books],
+  );
+  const [bookId, setBookId] = useState("");
+  const selectedBook = readyBooks.find((b) => b.id === bookId);
+  const standard = (selectedBook ? bookLabel(selectedBook) : "") as ContractStandard;
+
+  // The book already attached to this project (edit mode) — pre-selects the
+  // picker, and tells us whether the clauses need re-copying on save.
+  const { data: existingBookId } = useClauseBookQuery(editId ?? "");
+  const selectBook = useSelectClauseBook(editId ?? "");
+  const seededBook = useRef(false);
+  useEffect(() => {
+    if (!isEdit || seededBook.current || !existingBookId) return;
+    seededBook.current = true;
+    setBookId(existingBookId);
+  }, [isEdit, existingBookId]);
+
   const [value, setValue] = useState(editing?.value ? String(editing.value) : "");
   const [currency, setCurrency] = useState(editing?.currency ?? "OMR");
   const [loaRef, setLoaRef] = useState(editing?.loaRef ?? "");
@@ -63,7 +89,7 @@ export function CreateProjectPage() {
   // Baseline
   const [baselineProgramme, setBaselineProgramme] = useState(editing?.baselineProgramme ?? "");
 
-  const [errors, setErrors] = useState<{ name?: string; contractor?: string }>({});
+  const [errors, setErrors] = useState<{ name?: string; contractor?: string; book?: string }>({});
   const [submitError, setSubmitError] = useState("");
   const [tab, setTab] = useState<StepId>("basics");
 
@@ -74,9 +100,11 @@ export function CreateProjectPage() {
     const next: typeof errors = {};
     if (!name.trim()) next.name = "Project name is required.";
     if (!contractor.trim()) next.contractor = "Contractor is required.";
+    if (!bookId) next.book = "Choose the contract book this project is governed by.";
     setErrors(next);
     if (Object.keys(next).length) {
-      setTab("basics");
+      // Land on the step holding the first problem, so the message is visible.
+      setTab(next.name || next.contractor ? "basics" : "contract");
       return;
     }
 
@@ -107,7 +135,22 @@ export function CreateProjectPage() {
     };
     setSubmitError("");
     createProject.mutate(project, {
-      onSuccess: () => navigate("/projects"),
+      onSuccess: async () => {
+        // Copy the chosen book's clauses into the project's clause library — the
+        // base set the delay-event analysis and any PCC comparison work from.
+        // On edit, only when the book actually changed: re-selecting the same one
+        // would discard the PCC amendments sitting on top of it.
+        if (!isEdit || bookId !== existingBookId) {
+          try {
+            if (isEdit) await selectBook.mutateAsync(bookId);
+            else await selectClauseBookApi(id, bookId);
+          } catch (err) {
+            setSubmitError(apiErrorMessage(err, "Could not attach the contract book's clauses."));
+            return;
+          }
+        }
+        navigate("/projects");
+      },
       onError: (err) => setSubmitError(apiErrorMessage(err, "Could not create project — is the backend running?")),
     });
   }
@@ -193,10 +236,64 @@ export function CreateProjectPage() {
               <CardHeader title="Contract" subtitle="The contractual basis for the engagement" />
               <div className="p-5 space-y-5">
                 <div>
-                  <label className="label" htmlFor="standard">Contract standard</label>
-                  <select id="standard" className="input" value={standard} onChange={(e) => setStandard(e.target.value as ContractStandard)}>
-                    {STANDARDS.map((s) => <option key={s} value={s}>{s}</option>)}
+                  <label className="label" htmlFor="bookId">Contract book</label>
+                  <select
+                    id="bookId"
+                    className="input"
+                    value={bookId}
+                    onChange={(e) => {
+                      setBookId(e.target.value);
+                      setErrors((prev) => ({ ...prev, book: undefined }));
+                    }}
+                    disabled={booksLoading}
+                  >
+                    <option value="">
+                      {booksLoading
+                        ? "Loading contract books…"
+                        : readyBooks.length === 0
+                          ? "No contract books available"
+                          : "Select a contract book…"}
+                    </option>
+                    {readyBooks.map((b) => (
+                      <option key={b.id} value={b.id}>
+                        {bookLabel(b)} — {b.clauseCount} clause{b.clauseCount === 1 ? "" : "s"}
+                      </option>
+                    ))}
                   </select>
+                  {errors.book && <p className="mt-1 text-xs text-error">{errors.book}</p>}
+
+                  {/* What the chosen book does for the project, and how to get one
+                      when the Knowledge Center is empty or still extracting. */}
+                  {selectedBook ? (
+                    <div className="mt-2 flex items-start gap-2 rounded-lg border border-border bg-navy-50/40 px-3 py-2.5 text-xs">
+                      <BookOpen className="size-4 shrink-0 mt-px text-navy-600" />
+                      <span className="text-muted">
+                        <span className="font-semibold text-ink">{bookLabel(selectedBook)}</span>
+                        {selectedBook.publisher ? ` · ${selectedBook.publisher}` : ""} — its{" "}
+                        {selectedBook.clauseCount} extracted clauses become this project's Clause
+                        Library, and the AI cites them across the delay events and the EOT claim.
+                      </span>
+                    </div>
+                  ) : !booksLoading && readyBooks.length === 0 ? (
+                    <div className="mt-2 flex items-start gap-2 rounded-lg border border-border bg-warning-bg/50 px-3 py-2.5 text-xs text-warning">
+                      <BookOpen className="size-4 shrink-0 mt-px" />
+                      <span>
+                        {pendingBooks.length > 0
+                          ? `${pendingBooks.length} book${pendingBooks.length === 1 ? " is" : "s are"} still being read by the AI — selectable once extraction finishes. `
+                          : "No contract books have been uploaded yet. "}
+                        <Link to="/knowledge" className="font-semibold underline">
+                          Open the Knowledge Center
+                        </Link>{" "}
+                        to upload one.
+                      </span>
+                    </div>
+                  ) : (
+                    <p className="mt-1 text-xs text-faint">
+                      The contract this project is governed by — picked from the{" "}
+                      <Link to="/knowledge" className="underline">Knowledge Center</Link>. Its clauses
+                      become the project's Clause Library.
+                    </p>
+                  )}
                 </div>
                 <div className="grid sm:grid-cols-3 gap-5">
                   <div className="sm:col-span-2">

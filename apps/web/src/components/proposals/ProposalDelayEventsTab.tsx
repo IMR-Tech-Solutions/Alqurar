@@ -1,10 +1,19 @@
 import { useMemo, useState } from "react";
-import { AlertTriangle, ChevronDown, ListChecks, Loader2, Sparkles } from "lucide-react";
+import { AlertTriangle, BookOpen, ChevronDown, ListChecks, Loader2, Scale, Sparkles } from "lucide-react";
 import { Card } from "@/components/ui/Card";
 import { useDelayEvents, useDelayEventsExtractor } from "@/hooks/useDelayEvents";
 import { useProjectDocuments } from "@/hooks/useProjectDocuments";
-import type { ProjectDelayEvent } from "@/types";
+import { useClauseBookQuery, useProjectClausesQuery } from "@/hooks/useProjectClauses";
+import { useBooksQuery } from "@/hooks/useKnowledge";
+import type { ClauseRef, ProjectDelayEvent } from "@/types";
 import { cn } from "@/lib/utils";
+
+/** Just the digits and dots of a clause reference — "Sub-Clause 8.5(a)" → "8.5".
+ *  Lets an event's cited clause match a library row however either is worded. */
+function clauseKey(ref: string): string {
+  const m = (ref || "").match(/\d+(?:\.\d+)*/);
+  return m ? m[0] : "";
+}
 
 /** An event's narrative as a clean description (whitespace normalised, not cut). */
 function description(text: string): string {
@@ -30,6 +39,29 @@ export function ProposalDelayEventsTab({ proposalId }: { proposalId: string }) {
   const { data: docs = [], isLoading: docsLoading } = useProjectDocuments(proposalId);
   const extract = useDelayEventsExtractor(proposalId, !isLoading, events.length);
   const [openId, setOpenId] = useState<string | null>(null);
+
+  // The contract book chosen for this proposal, and the clauses copied from it —
+  // the AI cites these when it identifies the events, so each event is shown
+  // against the actual book clause it falls under.
+  const { data: bookId } = useClauseBookQuery(proposalId);
+  const { data: books = [] } = useBooksQuery();
+  const { data: clauses = [] } = useProjectClausesQuery(proposalId);
+  const book = books.find((b) => b.id === bookId);
+  const bookName = book ? [book.name, book.edition].filter(Boolean).join(" ") : "";
+
+  // Book-sourced clauses indexed by their bare number, for the lookup below.
+  const clausesByNumber = useMemo(() => {
+    const map = new Map<string, ClauseRef>();
+    for (const c of clauses) {
+      const key = clauseKey(c.clause);
+      if (key && !map.has(key)) map.set(key, c);
+    }
+    return map;
+  }, [clauses]);
+
+  /** The library clause an event cites, when it resolves to one. */
+  const clauseFor = (e: ProjectDelayEvent): ClauseRef | undefined =>
+    e.clause ? clausesByNumber.get(clauseKey(e.clause)) : undefined;
 
   const toggle = (id: string) => setOpenId((cur) => (cur === id ? null : id));
 
@@ -72,7 +104,8 @@ export function ProposalDelayEventsTab({ proposalId }: { proposalId: string }) {
         <div>
           <h3 className="text-base font-semibold text-ink">Delay events</h3>
           <p className="text-xs text-muted mt-0.5">
-            AI reads the uploaded documents and identifies the delay events — name and a short description of each.
+            AI reads the uploaded documents and identifies the delay events — name, a short description,
+            and the contract clause each falls under.
           </p>
         </div>
         <button className="btn btn-primary btn-sm" onClick={handleExtract} disabled={extract.isRunning}>
@@ -80,6 +113,26 @@ export function ProposalDelayEventsTab({ proposalId }: { proposalId: string }) {
           {extract.isRunning ? "Identifying…" : "Identify with AI"}
         </button>
       </div>
+
+      {/* The Knowledge-Center book whose clauses the events are assessed against. */}
+      {bookName ? (
+        <div className="flex items-start gap-2 rounded-lg border border-border bg-navy-50/40 px-3 py-2.5 text-xs text-muted">
+          <BookOpen className="size-4 shrink-0 mt-px text-navy-600" />
+          <span>
+            Clauses taken from <span className="font-semibold text-ink">{bookName}</span>
+            {clauses.length > 0 && ` — ${clauses.length} clauses in this proposal's library`}. Each event
+            below is cited against this book.
+          </span>
+        </div>
+      ) : (
+        <div className="flex items-start gap-2 rounded-lg border border-border bg-warning-bg/50 px-3 py-2.5 text-xs text-warning">
+          <BookOpen className="size-4 shrink-0 mt-px" />
+          <span>
+            No contract book is attached to this proposal, so the events can't be cited against real
+            clauses. Pick one in the proposal's details (Edit proposal → Contract book).
+          </span>
+        </div>
+      )}
 
       {extract.isRunning && (
         <div className="flex items-start gap-2 rounded-lg bg-navy-50/60 px-3 py-2.5 text-xs text-navy-700">
@@ -136,6 +189,7 @@ export function ProposalDelayEventsTab({ proposalId }: { proposalId: string }) {
             {events.map((e, i) => {
               const open = openId === e.id;
               const missingDoc = unevidenced(e);
+              const clause = clauseFor(e);
               return (
                 <Card key={e.id} className="p-0 overflow-hidden">
                   <button
@@ -153,6 +207,14 @@ export function ProposalDelayEventsTab({ proposalId }: { proposalId: string }) {
                       {i + 1}
                     </span>
                     <p className="min-w-0 flex-1 text-sm font-semibold text-ink leading-snug">{e.title}</p>
+                    {e.clause && (
+                      <span
+                        className="shrink-0 inline-flex items-center gap-1 rounded-md bg-navy-100 px-2 py-0.5 text-[11px] font-semibold text-navy-700"
+                        title={clause ? `${clause.clause} ${clause.title}` : e.clause}
+                      >
+                        <Scale className="size-3" /> {e.clause}
+                      </span>
+                    )}
                     {missingDoc && (
                       <span className="shrink-0 inline-flex items-center gap-1 rounded-md bg-warning-bg px-2 py-0.5 text-[11px] font-semibold text-warning">
                         <AlertTriangle className="size-3" /> No document
@@ -173,8 +235,28 @@ export function ProposalDelayEventsTab({ proposalId }: { proposalId: string }) {
                     </div>
                   )}
                   {open && (
-                    <div className="px-4 pb-4 pl-15">
+                    <div className="px-4 pb-4 pl-15 space-y-3">
                       <p className="text-sm text-muted leading-relaxed">{description(e.narrative)}</p>
+                      {/* The book clause this event is assessed under — the wording
+                          comes from the proposal's clause library, so it is the
+                          selected book's own text, not a canned reference. */}
+                      {clause ? (
+                        <div className="rounded-lg border border-border bg-navy-50/40 px-3 py-2.5">
+                          <p className="text-xs font-semibold text-ink flex items-center gap-1.5">
+                            <Scale className="size-3.5 text-navy-600" />
+                            {clause.clause} — {clause.title}
+                            {clause.book && <span className="font-normal text-faint">· {clause.book}</span>}
+                          </p>
+                          {clause.summary && (
+                            <p className="mt-1 text-xs text-muted leading-relaxed">{clause.summary}</p>
+                          )}
+                        </div>
+                      ) : e.clause ? (
+                        <p className="text-xs text-faint">
+                          Cited clause <span className="font-semibold text-muted">{e.clause}</span> — not
+                          found in this proposal's clause library.
+                        </p>
+                      ) : null}
                     </div>
                   )}
                 </Card>
